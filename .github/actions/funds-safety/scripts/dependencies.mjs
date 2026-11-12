@@ -45,6 +45,18 @@ async function getJson(url, cache) {
   return p;
 }
 
+/**
+ * The host an npm entry downloads from, or null when the lockfile doesn't say (yarn berry). A
+ * default-registry entry counts as registry.npmjs.org: for a private scope that is the
+ * dependency-confusion case, not "the registry".
+ */
+export function resolvedHost(e) {
+  if (e.resolved) return sourceHost(e.resolved);
+  if (e.source !== 'registry') return sourceHost(e.source) || e.source;
+  if (e.key !== undefined) return 'registry.npmjs.org'; // bun.lock: '' means the default registry
+  return null;
+}
+
 const scopeOf = (name) => (name.startsWith('@') ? name.split('/')[0] : '');
 
 /** Registry checks for one new npm entry from the public registry. */
@@ -125,10 +137,11 @@ export async function registryFindings(diff, cfg, now) {
       const scope = scopeOf(e.name);
       const privateHost = cfg.private_scopes[scope];
       if (e.eco === 'npm' && privateHost) {
-        // The scope must resolve to its own registry (bun and npm locks carry the URL; yarn berry's
-        // comes from .yarnrc.yml, which the sensitive-file guard covers).
-        const host = sourceHost(e.source);
-        if (e.source !== 'registry' && host !== privateHost) jobs.push(() => [{ rule: 'private-scope-source', severity: 'block', file: e.file, name: e.name, version: e.version, message: `${scope} must resolve to ${privateHost}, not \`${e.source}\`` }]);
+        const host = resolvedHost(e);
+        // null: yarn berry, whose lockfile has no URL; .yarnrc.yml decides (a sensitive file).
+        if (host !== null && host !== privateHost) {
+          jobs.push(() => [{ rule: 'private-scope-source', severity: 'block', file: e.file, name: e.name, version: e.version, message: `${scope} must resolve to ${privateHost}, not ${host} (dependency confusion)` }]);
+        }
         continue;
       }
       if (e.source !== 'registry') continue; // lockfileFindings handles other sources
