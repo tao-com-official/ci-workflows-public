@@ -5,7 +5,13 @@ name: security-scans
 # Semgrep pinned by image digest. web-app keeps its bun-audit job in its own repo.
 #
 # Callers use one job named `security-scans`, so the checks are `security-scans / gitleaks`,
-# `security-scans / semgrep` and `security-scans / osv` in every repo. OSV runs as a plain job
+# `security-scans / semgrep`, `security-scans / osv`, `security-scans / funds-safety` and
+# `security-scans / dependencies` in every repo.
+#
+# funds-safety and dependencies (v0.2.0) look for changes that could steal or redirect user funds:
+# tao Semgrep rules, address and sensitive-file checks on the diff, new LavaMoat powers, and a
+# lockfile guard. They read the repo's .github/funds-safety.json from the BASE commit, judge only what
+# the change introduces, and need `pull-requests: read` from the caller to look up approvals. OSV runs as a plain job
 # rather than through google's reusable workflow, which would add a third level to the check name.
 
 on:
@@ -190,3 +196,81 @@ jobs:
             --new=new-results.json
             --gh-annotations=true
             --fail-on-vuln=true
+
+  # tao Semgrep rules plus diff checks. Fails on blocking findings the change introduces, unless an
+  # approver from the base branch's .github/funds-safety.json approved this exact head commit.
+  funds-safety:
+    name: funds-safety
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      # On a PR the checkout is the merge commit, so its first parent is the base branch as merged
+      # (pull_request.base.sha can be stale and would blame others' changes on this PR).
+      - name: Pick the base to compare with
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT" in
+            pull_request) echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT" ;;
+            merge_group) echo "sha=$MQ_BASE" >> "$GITHUB_OUTPUT" ;;
+            *) echo "sha=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@1562989174dedba79d801c95bfbfa8d6c64452a1 # exported from ci-workflows security-scans-v0.2.0
+        with:
+          check: funds-safety
+          base: ${{ steps.base.outputs.sha }}
+          github_token: ${{ github.token }}
+
+  # Every lockfile change listed in the job summary; blocks on non-registry sources, lost or wrong
+  # integrity, versions under 7 days old and provenance regressions. GuardDog reports only.
+  dependencies:
+    name: dependencies
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Pick the base to compare with
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT" in
+            pull_request) echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT" ;;
+            merge_group) echo "sha=$MQ_BASE" >> "$GITHUB_OUTPUT" ;;
+            *) echo "sha=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@1562989174dedba79d801c95bfbfa8d6c64452a1 # exported from ci-workflows security-scans-v0.2.0
+        with:
+          check: dependencies
+          base: ${{ steps.base.outputs.sha }}
+          github_token: ${{ github.token }}
