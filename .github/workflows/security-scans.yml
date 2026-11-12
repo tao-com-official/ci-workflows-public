@@ -1,0 +1,192 @@
+name: security-scans
+
+# Gitleaks, Semgrep and OSV for every app. Ported from web-app's .github/workflows/security.yml
+# (main d45fb49c, 2026-11-10): Gitleaks over the full history with a checksum-verified install,
+# Semgrep pinned by image digest. web-app keeps its bun-audit job in its own repo.
+#
+# Callers use one job named `security-scans`, so the checks are `security-scans / gitleaks`,
+# `security-scans / semgrep` and `security-scans / osv` in every repo. OSV runs as a plain job
+# rather than through google's reusable workflow, which would add a third level to the check name.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        type: string
+        default: ubuntu-24.04
+      osv_scan_args:
+        description: osv-scanner arguments, one per line (not --format or --output).
+        type: string
+        # --allow-no-lockfiles: without it a repo (or a base commit) with no lockfile exits 128 and
+        # writes no results, which the completion check below rightly treats as a crash.
+        default: |-
+          --allow-no-lockfiles
+          -r
+          ./
+      semgrep_exclude_rules:
+        description: Semgrep rule ids to exclude, one per line.
+        type: string
+        default: |-
+          yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag
+
+permissions: {}
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The open-source CLI: gitleaks/gitleaks-action needs a paid licence in an organisation.
+      - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x64 ;;
+            aarch64|arm64) arch=arm64 ;;
+            *) echo "::error::No Gitleaks build for $(uname -m)."; exit 1 ;;
+          esac
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz"
+          curl -sSLf -o "$tarball" "$base/$tarball"
+          curl -sSLf -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          # Verify before extracting. grep narrows the list to our asset so sha256sum can't pass on
+          # an empty list.
+          grep " ${tarball}\$" checksums.txt | sha256sum --check -
+          tar -xzf "$tarball" gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          rm -f "$tarball" checksums.txt
+          gitleaks version
+
+      # Reads .gitleaks.toml and .gitleaksignore from the repo root. Without --log-opts gitleaks runs
+      # `git log --all`, and fetch-depth 0 fetches every branch, so a finding on someone else's
+      # unmerged branch would fail every PR. Scan the full history of HEAD instead.
+      - name: Scan for secrets
+        run: >-
+          gitleaks detect --source . --verbose --redact --no-banner
+          --log-opts="--full-history --diff-filter=tuxdb HEAD"
+
+  semgrep:
+    name: semgrep
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    container:
+      # Pinned by digest so a re-pushed tag can't change what runs. Bump both together.
+      image: semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b # 1.172.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # OSS engine and Registry rules; no SEMGREP_APP_TOKEN.
+      - name: Scan
+        env:
+          EXCLUDES: ${{ inputs.semgrep_exclude_rules }}
+        run: |
+          set -eu
+          set -- semgrep scan --config auto --error --quiet
+          for r in $EXCLUDES; do set -- "$@" --exclude-rule "$r"; done
+          "$@"
+
+  # On a PR or in the merge queue: fails only on advisories the change introduces (base vs head).
+  # On a schedule or manual run: fails on any advisory not accepted in osv-scanner.toml.
+  osv:
+    name: osv
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the base to compare with
+        id: base
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+        run: echo "sha=${PR_BASE:-$MQ_BASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the base
+        if: steps.base.outputs.sha != ''
+        env:
+          BASE: ${{ steps.base.outputs.sha }}
+        run: git checkout -q "$BASE"
+
+      - name: Scan the base
+        id: scan-old
+        if: steps.base.outputs.sha != ''
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        env:
+          GOTOOLCHAIN: auto
+        with:
+          scan-args: |-
+            --format=json
+            --output=old-results.json
+            ${{ inputs.osv_scan_args }}
+
+      - name: Check out the change
+        if: steps.base.outputs.sha != ''
+        run: git checkout -q -f "$GITHUB_SHA"
+
+      - name: Scan the change
+        id: scan-new
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        env:
+          GOTOOLCHAIN: auto
+        with:
+          scan-args: |-
+            --format=json
+            --output=new-results.json
+            ${{ inputs.osv_scan_args }}
+
+      # osv-scanner exits non-zero when it finds advisories, so the outcome alone can't tell a
+      # finding from a crash. A scan that wrote no results is a crash: fail rather than pass.
+      - name: Check the scans completed
+        env:
+          HAS_BASE: ${{ steps.base.outputs.sha != '' }}
+        run: |
+          status=0
+          if [ "$HAS_BASE" = true ] && [ ! -s old-results.json ]; then
+            echo "::error::OSV-Scanner wrote no results for the base. See 'Scan the base'."; status=1
+          fi
+          if [ ! -s new-results.json ]; then
+            echo "::error::OSV-Scanner wrote no results for this change. See 'Scan the change'."; status=1
+          fi
+          exit "$status"
+
+      - name: Report new advisories
+        if: steps.base.outputs.sha != ''
+        uses: google/osv-scanner-action/osv-reporter-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        with:
+          scan-args: |-
+            --output=results.sarif
+            --old=old-results.json
+            --new=new-results.json
+            --gh-annotations=true
+            --fail-on-vuln=true
+
+      - name: Report all advisories
+        if: steps.base.outputs.sha == ''
+        uses: google/osv-scanner-action/osv-reporter-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        with:
+          scan-args: |-
+            --output=results.sarif
+            --new=new-results.json
+            --gh-annotations=true
+            --fail-on-vuln=true

@@ -1,0 +1,405 @@
+name: security-review
+
+# The shared AI security review. It runs as a later job in the same caller as the code review
+# (callers/claude-review.yml), with one job named `security-review`, so the check is always
+# `security-review / review`; on pull_request events it reports on the PR's head SHA.
+#
+# Standalone (`standalone: true`, callers/security-review-standalone.yml): for repos that don't run
+# the code review, such as the public SDKs, which call the security-only export in
+# tao-com-official/ci-workflows-public (scripts/export-public.sh). It runs at once on every push.
+#
+# Fails closed, before checking anything out, on a fork's PR and on any run without the Claude
+# token (a Dependabot PR without Dependabot secrets): a maintainer pushes the branch into the repo
+# to get a review.
+#
+# Staged gate: the security review runs once the code review of the head SHA has no open Important
+# findings, or at once when the PR has the label `ai:security-now` or its path floor is High.
+# Until then the check FAILS with "Waits for the code review to pass". It never skips, because a
+# skipped required check counts as passed. The merge queue passes straight through: the PR was
+# reviewed before it queued.
+#
+# Findings post as inline threads that start with <!-- ai-review:security --> and
+# **Security (S1 · …):**. The risk gate counts a Security thread resolved by the author, or by
+# someone outside the trusted teams, as open. Fixed ones are resolved by the resolve job below.
+# The prompt (Appendix B) and the appsec checklists ship in the ai-review action.
+
+on:
+  workflow_call:
+    inputs:
+      # Standalone: for callers that don't run the code review (the public SDKs). The security
+      # review then runs at once on every PR push, and the review_* inputs are ignored.
+      standalone:
+        description: Run without waiting for a code review in the same caller.
+        type: boolean
+        default: false
+      # From the code review job in the same caller: `needs.claude-review.result` and its outputs.
+      review_result:
+        description: The code review job's result (success, failure, cancelled or skipped). Required unless standalone.
+        type: string
+        default: ''
+      review_commit_sha:
+        description: The head SHA the code review covered (its commit_sha output).
+        type: string
+        default: ''
+      review_important:
+        description: Open Important findings in that code review (its important output).
+        type: string
+        default: ''
+      review_tier:
+        description: The path-floor tier (Low, Medium or High) from the code review's tier output.
+        type: string
+        default: ''
+      label:
+        description: The label that starts the security review before the code review is clean.
+        type: string
+        default: ai:security-now
+      model:
+        description: The model on Medium and High tier PRs (and when the tier is unknown).
+        type: string
+        default: claude-opus-5-5
+      model_low:
+        description: The model on Low tier PRs.
+        type: string
+        default: claude-sonnet-5-5
+      server_paths:
+        description: Newline-separated globs of server code. The backend checklist applies only to these.
+        type: string
+        default: ''
+      skip_paths:
+        description: Newline-separated globs left out of the diff the reviewer reads.
+        type: string
+        default: ''
+      runs_on:
+        type: string
+        default: ubuntu-24.04
+    secrets:
+      # Not `required`, so a run without it (a fork's PR, a Dependabot PR without Dependabot secrets)
+      # reaches the gate and fails with a reason instead of a bare startup error.
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+    outputs:
+      ran:
+        description: '"true" when the security review ran (or reused its review of this head SHA).'
+        value: ${{ jobs.review.outputs.ran }}
+      findings:
+        description: Open Security findings on the head SHA, when it ran.
+        value: ${{ jobs.review.outputs.findings }}
+
+permissions: {}
+
+jobs:
+  review:
+    name: review
+    # Drafts are skipped, as the code review skips them: a draft can't merge, and ready_for_review
+    # re-runs both. Nothing else skips; waiting is a failure, not a skip.
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 40
+    # One group per PR, so a newer push cancels an older security review. Only a push cancels, as in
+    # the code review. Comment runs that aren't review requests get a group of their own.
+    concurrency:
+      group: >-
+        ai-review-security-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{
+        (github.event_name == 'pull_request' ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude review this')))
+        && 'active' || github.run_id }}
+      # A label event queues instead of cancelling, then reuses the review it waited for.
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.action != 'unlabeled' }}
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    outputs:
+      pr: ${{ steps.pr.outputs.number }}
+      ran: ${{ steps.gate.outputs.run }}
+      reused: ${{ steps.fetch.outputs.reuse }}
+      findings: ${{ steps.meta.outputs.findings }}
+    steps:
+      # The live PR, not the event payload: a label added after this run started still counts, and
+      # the head SHA is the one the check reports on.
+      - name: Find the PR
+        id: pr
+        if: github.event_name != 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NUMBER" ]; then echo "number=" >> "$GITHUB_OUTPUT"; exit 0; fi
+          gh pr view "$NUMBER" -R "$REPO" --json headRefOid,labels,isCrossRepository > pr.json
+          {
+            echo "number=$NUMBER"
+            echo "head_sha=$(jq -r .headRefOid pr.json)"
+            echo "cross_repo=$(jq -r .isCrossRepository pr.json)"
+            echo "labelled=$(jq -r --arg l "$LABEL" '[.labels[].name] | index($l) != null' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+          rm -f pr.json
+
+      # Decides from env alone (tests/security-review.test.mjs runs this block). Exit 1 is the
+      # "waits" failure; run=false with exit 0 is a pass-through.
+      - name: Is it time for the security review?
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          REQUESTED: ${{ github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude review this') }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          LABELLED: ${{ steps.pr.outputs.labelled }}
+          LABEL: ${{ inputs.label }}
+          REVIEW_RESULT: ${{ inputs.review_result }}
+          REVIEW_SHA: ${{ inputs.review_commit_sha }}
+          REVIEW_IMPORTANT: ${{ inputs.review_important }}
+          REVIEW_TIER: ${{ inputs.review_tier }}
+          STANDALONE: ${{ inputs.standalone }}
+          CROSS_REPO: ${{ steps.pr.outputs.cross_repo }}
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          pass() { echo "::notice title=security-review passes through::$1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          case "$EVENT" in
+            merge_group) pass "Reviewed on the pull request." ;;
+            issue_comment) [ "$REQUESTED" = true ] || pass "This comment doesn't ask for a review." ;;
+          esac
+          [ -n "$NUMBER" ] || pass "No pull request in this event."
+          # Fail closed, never skip: a skipped required check counts as passed. A fork's PR is never
+          # reviewed with the Claude token, even where the repo would send it secrets.
+          if [ "$CROSS_REPO" = true ]; then
+            echo "::error title=No security review on a fork's pull request::A maintainer must read the diff (especially .github/), push this branch into this repository and open a pull request from it; that one gets the security review."
+            exit 1
+          fi
+          if [ "$HAS_TOKEN" != true ]; then
+            echo "::error title=No security review without the Claude token::This run has no CLAUDE_CODE_OAUTH_TOKEN, as on a pull request from a fork or a Dependabot PR without Dependabot secrets. A maintainer must push the branch into this repository (or re-run it there) to get a security review."
+            exit 1
+          fi
+          why=""
+          if [ "$STANDALONE" = true ]; then why="it runs standalone, with no code review in this caller"
+          elif [ "$LABELLED" = true ]; then why="the PR has the label $LABEL"
+          elif [ "$REVIEW_TIER" = High ]; then why="the path floor is High"
+          elif [ "$REVIEW_RESULT" = success ] && [ "$REVIEW_SHA" = "$HEAD_SHA" ] && [ "$REVIEW_IMPORTANT" = 0 ]; then
+            why="the code review of ${HEAD_SHA:0:7} has no open Important findings"
+          fi
+          if [ -n "$why" ]; then
+            echo "Running the security review: $why."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$REVIEW_RESULT" != success ]; then
+            wait="the code review didn't finish (result: ${REVIEW_RESULT:-none})"
+          elif [ "$REVIEW_SHA" != "$HEAD_SHA" ]; then
+            wait="the code review covered ${REVIEW_SHA:0:7}, not the head ${HEAD_SHA:0:7}"
+          else
+            wait="the code review of ${HEAD_SHA:0:7} has ${REVIEW_IMPORTANT:-?} open Important finding(s)"
+          fi
+          echo "::error title=Waits for the code review to pass::The security review hasn't run: $wait. It runs once the code review has no open Important findings, or at once if someone adds the label $LABEL."
+          exit 1
+
+      - name: Checkout PR head
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fetch PR data and repo rules
+        id: fetch
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          MARKER: '<!-- ai-review:security -->'
+        run: |
+          set -euo pipefail
+          # Nothing the PR committed may pose as an input or an output, or as Claude's settings.
+          rm -rf review-context pr-diff.txt full.diff since.diff pr-description.md diff-info.json \
+                 security-body.md security-comments.json security-fixed.json security-meta.json security.json \
+                 .claude/settings.json .claude/settings.local.json .mcp.json
+          mkdir -p review-context
+          echo "commit_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+          # Earlier rounds of THIS reviewer only, found by the marker, never by the bot's login.
+          bot='github-actions[bot]'
+          gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+            -q "[.[] | select(.user.login == \"$bot\" and (.body | startswith(\"$MARKER\")))] | .[] | [.id, .commit_id] | @tsv" > earlier-reviews.tsv
+          rounds=$(wc -l < earlier-reviews.tsv | tr -d ' ')
+          last_sha=$(tail -n 1 earlier-reviews.tsv | cut -f2)
+          echo "round=$((rounds + 1))" >> "$GITHUB_OUTPUT"
+
+          # Any workflow run in the repo can upload an artifact with this name, so trust only one
+          # uploaded by a run from this repo (not a fork) for that same SHA, or by a default-branch
+          # run ("@claude review this" runs main's own workflow).
+          default_branch=$(gh api "repos/$REPO" -q .default_branch)
+          prev_meta() {
+            local art
+            art=$(gh api "repos/$REPO/actions/artifacts?name=ai-review-security-meta-$1&per_page=100" \
+              -q "[.artifacts[] | select((.expired | not) and .workflow_run.head_repository_id == .workflow_run.repository_id and (.workflow_run.head_sha == \"$1\" or .workflow_run.head_branch == \"$default_branch\"))][0].archive_download_url // \"\"")
+            [ -n "$art" ] && gh api "$art" > prev-meta.zip 2>/dev/null && unzip -o -q prev-meta.zip -d prev-meta
+          }
+
+          # A re-run on a head SHA this reviewer already covered (a label added, a re-run) reuses
+          # that review instead of posting another.
+          if [ -n "$last_sha" ] && [ "$last_sha" = "$HEAD_SHA" ] && prev_meta "$HEAD_SHA"; then
+            cp prev-meta/security-meta.json security-meta.json
+            rm -rf prev-meta prev-meta.zip
+            echo "Security review of ${HEAD_SHA:0:7} already posted; reusing it."
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "reuse=false" >> "$GITHUB_OUTPUT"
+
+          gh pr diff "$PR" -R "$REPO" > full.diff
+          gh pr view "$PR" -R "$REPO" --json title,body -q '"## " + .title + "\n\n" + (.body // "")' > pr-description.md
+
+          # Rules come from the base branch, never the PR, so a PR can't rewrite the rules it's
+          # reviewed against. The checkout keeps no credentials, so pass them here only.
+          base_ref=$(gh pr view "$PR" -R "$REPO" --json baseRefName -q .baseRefName)
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            fetch --no-tags --depth=1 "https://github.com/${REPO}.git" "$base_ref"
+          git show FETCH_HEAD:.github/security-review.md > review-context/security-review.md 2>/dev/null \
+            || : > review-context/security-review.md
+          git show FETCH_HEAD:.github/risk.yml > risk.yml 2>/dev/null || rm -f risk.yml
+
+          # Inline findings already posted, as `[comment-id] path:line — first line`.
+          gh api --paginate "repos/$REPO/pulls/$PR/comments" \
+            -q ".[] | select(.user.login == \"$bot\" and .in_reply_to_id == null and (.body | startswith(\"$MARKER\"))) | \"- [\(.id)] \(.path):\(.line // .original_line) — \(.body | split(\"\n\")[1] // \"\" | .[0:300])\"" \
+            > review-context/already-raised.md
+          # Hardening notes (summary only) from the last round's meta, so they stay listed.
+          if [ -n "$last_sha" ] && prev_meta "$last_sha"; then
+            jq -r '.open[]? | select(.id | test("^S") | not) | "- [-] \(.id) \(.fingerprint) — \(.tag), summary only"' prev-meta/security-meta.json \
+              >> review-context/already-raised.md || true
+          fi
+          rm -rf prev-meta prev-meta.zip
+
+          : > since.diff
+          if [ -n "$last_sha" ] && [ "$last_sha" != "$HEAD_SHA" ]; then
+            gh api "repos/$REPO/compare/$last_sha...$HEAD_SHA" -H 'Accept: application/vnd.github.diff' \
+              > since.full.diff 2>/dev/null || : > since.full.diff
+            head -c 200000 since.full.diff > since.diff
+            rm -f since.full.diff
+          fi
+
+      - name: Security review
+        id: review
+        if: steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false'
+        uses: tao-com-official/ci-workflows-public/.github/actions/security-review@9d9c1a52338d988bcb38c30100513a7f428d7376 # exported from ci-workflows security-review-v0.2.0
+        with:
+          reviewer: security
+          marker: security
+          output_prefix: security
+          pr: ${{ steps.pr.outputs.number }}
+          round: ${{ steps.fetch.outputs.round }}
+          # No round cap (past a cap the action drops inline threads, and Security threads are what
+          # block the merge). From round 2, pr-diff.txt is only the changes since the last review.
+          round_cap: 1000
+          since_from_round: 2
+          commit_id: ${{ steps.fetch.outputs.commit_sha }}
+          skip_paths: ${{ inputs.skip_paths }}
+          server_paths: ${{ inputs.server_paths }}
+          risk_file: ${{ hashFiles('risk.yml') != '' && 'risk.yml' || '' }}
+          # Sonnet on Low tier PRs, Opus otherwise (and when the tier is unknown).
+          model: ${{ inputs.review_tier == 'Low' && inputs.model_low || inputs.model }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+
+      - name: Read the security meta
+        id: meta
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          echo "findings=$(jq -r .important security-meta.json)" >> "$GITHUB_OUTPUT"
+          jq -c '{round, important, nits, coverage}' security-meta.json
+
+      # Keyed by head SHA, for the next round and for metrics. Only workflows can write artifacts.
+      - name: Upload the security meta
+        if: steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ai-review-security-meta-${{ steps.fetch.outputs.commit_sha }}
+          path: security-meta.json
+          overwrite: true
+          retention-days: 90
+
+      - name: Post the security review
+        if: steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Inline comments first; on a 422 (an unmappable line) retry with the comments stripped.
+          if ! gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input security.json > /dev/null; then
+            echo "Posting with inline comments failed. Retrying without them."
+            jq 'del(.comments)' security.json > security-fallback.json
+            gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input security-fallback.json > /dev/null
+          fi
+          echo "Posted: $(jq -r '.body | split("\n")[1]' security.json)"
+
+      # Resolving happens in its own job, so the AI step never holds a token that can resolve threads.
+      - name: Keep the fixed findings for the resolve job
+        if: steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ai-review-security-fixed
+          path: security-fixed.json
+          retention-days: 1
+
+  # Resolves the Security threads the review confirmed fixed. Only unresolved threads this reviewer
+  # opened (found by the marker) are touched. No AI, no PR code checked out.
+  resolve-fixed-threads:
+    needs: review
+    if: needs.review.result == 'success' && needs.review.outputs.ran == 'true' && needs.review.outputs.reused == 'false'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Get the fixed findings
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ai-review-security-fixed
+
+      - name: Resolve fixed threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.review.outputs.pr }}
+          REPO: ${{ github.repository }}
+          MARKER: '<!-- ai-review:security -->'
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array"' security-fixed.json >/dev/null || { echo "security-fixed.json is not an array."; exit 0; }
+          if [ "$(jq length security-fixed.json)" -eq 0 ]; then echo "Nothing confirmed fixed."; exit 0; fi
+          # The GraphQL $variables must reach gh unexpanded, hence the single quotes.
+          # shellcheck disable=SC2016
+          gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $pr) {
+                  reviewThreads(first: 100, after: $endCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes { id isResolved comments(first: 1) { nodes { databaseId body author { login } } } }
+                  }
+                }
+              }
+            }' \
+            --jq ".data.repository.pullRequest.reviewThreads.nodes[]
+              | select((.isResolved | not) and .comments.nodes[0].author.login == \"github-actions\"
+                       and (.comments.nodes[0].body | startswith(\"$MARKER\")))
+              | \"\(.comments.nodes[0].databaseId) \(.id)\"" > open-threads.txt \
+            || { echo "::error::Could not list the review threads."; exit 1; }
+          jq -r 'map(tostring) | unique | .[]' security-fixed.json | while read -r cid; do
+            [[ "$cid" =~ ^[0-9]+$ ]] || continue
+            tid=$(awk -v c="$cid" '$1 == c { print $2 }' open-threads.txt)
+            [ -n "$tid" ] || continue
+            # shellcheck disable=SC2016
+            gh api graphql -f id="$tid" \
+              -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }' >/dev/null \
+              || { echo "::error::Could not resolve the thread for comment $cid."; exit 1; }
+            echo "Resolved the thread for comment $cid."
+          done
