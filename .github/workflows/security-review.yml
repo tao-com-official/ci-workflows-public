@@ -286,7 +286,7 @@ jobs:
       - name: Security review
         id: review
         if: steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false'
-        uses: tao-com-official/ci-workflows-public/.github/actions/security-review@9d9c1a52338d988bcb38c30100513a7f428d7376 # exported from ci-workflows security-review-v0.2.0
+        uses: tao-com-official/ci-workflows-public/.github/actions/security-review@1562989174dedba79d801c95bfbfa8d6c64452a1 # exported from ci-workflows security-review-v0.3.0
         with:
           reviewer: security
           marker: security
