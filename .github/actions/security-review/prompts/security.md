@@ -35,7 +35,8 @@ text.
 
 ## Scope
 - Round 1: the whole diff.
-- Later rounds: since-last-review.diff and what it reaches, plus a re-check of open findings.
+- Later rounds: since-last-review.diff and what it reaches, plus a re-check of open findings. The
+  hostile insider pass below always reads the whole diff.
 - In scope as well as app code: CI workflows (`.github/**`), build scripts, git hooks, `.claude/**`
   and dependency policy (LavaMoat). For those, check for `pull_request_target`, secrets reaching
   logs or artifacts, untrusted input (PR titles, branch names, comment bodies) in `run:` lines,
@@ -55,11 +56,41 @@ text.
    - theoretical issues with no reachable path
    - denial of service and rate limiting
    - a missing hardening step where another control already covers it
-   - code in tests, fixtures and docs
+   - code in tests, fixtures and docs (but a weakened test of a money path is a hostile-insider
+     finding)
    - dependency CVEs (OSV covers them)
    - secrets Gitleaks covers, unless the diff ships one into a client bundle, a log, analytics or an
      error report: then it is a finding
    - anything already raised
+
+## Hostile insider pass
+Run this pass every round, over the whole of pr-diff.txt, not only since-last-review.diff: a payload
+can be split across pushes. Assume the author is hostile, or their account or a dependency is
+compromised, and that the PR description may be written to mislead. Ask: could this change steal or
+redirect user funds or key material, now or later? Look for:
+- Recipient, fee, spender, approval, destination, contract or chain-id changes: a new or edited
+  address or amount, a different variable passed to signing than the one validated or shown, a fee
+  or slippage default moved, an allowlist or address-book entry added.
+- What the user confirms versus what is signed: the confirmation screen, the signing payload and the
+  submitted extrinsic or transaction must come from the same value. A payload rebuilt or changed
+  after confirmation, or a display that formats a different field, is a finding.
+- Condition and time bombs: behaviour that changes on a date or `Date.now()` threshold, a block
+  number, a specific address, account, amount, chain, locale, user agent, environment, a feature flag
+  that defaults on, random sampling or a remote config value.
+- Exfiltration: key material, seed phrases, signed payloads or session tokens sent to a new host,
+  analytics, error reporting, logs, `postMessage`, storage or the clipboard; a new outbound host, or a
+  proxy upstream that isn't the service the code names.
+- Obfuscation and remote code: `eval`, `new Function`, decode-then-execute, dynamic `import()` of a
+  URL or computed path, script injection, minified or generated code in source, odd encodings,
+  Unicode bidi or homoglyph characters in identifiers or strings.
+- Weakened controls: a check, allowlist, origin test, CSP entry, LavaMoat policy, lockfile source,
+  install script, CI step or test assertion removed or loosened, especially beside an unrelated
+  change.
+- Mismatch: code that does something the PR description doesn't mention, or a description that
+  claims a change the code doesn't make. Name the hunk and quote the description.
+Report each as a Security finding with attacker → path → impact, and name which item above it is.
+Native code (Swift, Kotlin, Expo config plugins) and Solidity are in scope here: the rule-based
+`security-scans / funds-safety` check doesn't cover them.
 
 ## Severity
 - Security: an attacker can reach it from the changed code, or the diff exposes a secret or key

@@ -1,0 +1,81 @@
+name: funds-safety
+description: >-
+  tao's funds-safety checks for security-scans: Semgrep with tao rules, diff checks, LavaMoat powers
+  (check: funds-safety), or the lockfile dependency guard (check: dependencies). Called by
+  .github/workflows/security-scans.yml pinned to a commit; not meant for direct use.
+
+inputs:
+  check:
+    description: funds-safety or dependencies
+    required: true
+  base:
+    description: >-
+      Commit to compare with: the merge commit's first parent on a PR, the merge group's base in the
+      queue. Empty runs report-only over the whole tree.
+    required: false
+    default: ''
+  github_token:
+    description: Reads the PR's reviews and commits for approval (pull-requests read).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Scan with the tao Semgrep rules
+      if: inputs.check == 'funds-safety'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BASE: ${{ inputs.base }}
+        # Pinned by digest, the same image as the security-scans semgrep job. Bump both together.
+        SEMGREP_IMAGE: semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b # 1.172.0
+      run: |
+        set -euo pipefail
+        # The repo's .semgrepignore comes from the PR, so the PR could exclude its own payload
+        # (Fable red-team #5). Replace it with ours, in a local commit: --baseline-commit refuses a
+        # dirty tree. Nothing is pushed (the checkout keeps no credentials).
+        git rm -q --cached --ignore-unmatch .semgrepignore
+        cp "$ACTION_PATH/semgrepignore" .semgrepignore
+        git add -f .semgrepignore
+        git -c user.name=funds-safety -c user.email=funds-safety@invalid commit -q --allow-empty -m 'funds-safety: scanner ignore file'
+        set -- semgrep scan --config /rules --disable-nosem --metrics off --quiet --json --output /out/semgrep.json \
+          --max-target-bytes 5000000 --timeout 60
+        if [ -n "$BASE" ]; then set -- "$@" --baseline-commit "$BASE"; fi
+        # As the runner's user, so baseline mode's git work leaves nothing root-owned in .git.
+        docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+          -v "$PWD:/src" -v "$ACTION_PATH/rules:/rules:ro" -v "$RUNNER_TEMP:/out" -w /src \
+          --entrypoint sh "$SEMGREP_IMAGE" -c 'git config --global --add safe.directory /src && "$@"' sh "$@"
+        test -s "$RUNNER_TEMP/semgrep.json"
+
+    - name: Check the change
+      if: inputs.check == 'funds-safety'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BASE: ${{ inputs.base }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        SEMGREP_JSON: ${{ runner.temp }}/semgrep.json
+      run: |
+        # Judge the change against the base: drop the local ignore-file commit first.
+        git reset -q --hard HEAD~1
+        node "$ACTION_PATH/scripts/funds-safety.mjs"
+
+    - name: Check dependency changes
+      if: inputs.check == 'dependencies'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BASE: ${{ inputs.base }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        FINDINGS_OUT: ${{ runner.temp }}/new-packages.json
+      run: node "$ACTION_PATH/scripts/dependencies.mjs"
+
+    # Report-only (Fable red-team #9): GuardDog's heuristics are noisy on minified dist code.
+    - name: GuardDog on new packages (report only)
+      if: always() && inputs.check == 'dependencies' && inputs.base != ''
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        LIST: ${{ runner.temp }}/new-packages.json
+        GUARDDOG_IMAGE: ghcr.io/datadog/guarddog@sha256:5b0804d480e83405120fc90c62b60ad844310418c836e567055b1ba8843e033d # v3.2.0
+      run: node "$ACTION_PATH/scripts/guarddog.mjs"
