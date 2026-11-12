@@ -1,0 +1,29 @@
+{
+  "source": "tao-com-official/ci-workflows",
+  "security_review": {
+    "ref": "security-review-v0.2.0",
+    "commit": "2b41cb9a4160da9795ef6e4958da0b1f2e0a0000",
+    "action_commit": "3a80d968546bb00030c0c8736b26b5c7f9e701ad",
+    "public_action_commit": "9d9c1a52338d988bcb38c30100513a7f428d7376"
+  },
+  "security_scans": {
+    "ref": "security-scans-v0.1.0",
+    "commit": "7ae5e02f5be1b15a7364cc661b5ce16971622d8e"
+  },
+  "files": {
+    ".github/actions/security-review/action.yml": "0c437a28fef941a010bd94d2041e88cf3791dd44e7d9b7d5724634b2a3f96baf",
+    ".github/actions/security-review/checklists/SOURCES.md": "3b876e5268341b500af292d32ebd4d23dd22657e05d8f238b6365cf3a77fa5db",
+    ".github/actions/security-review/checklists/security/backend.md": "30edfe0713e1b6d85634710ad4d4963332a12e4995cc1935597f079eb6b7aebb",
+    ".github/actions/security-review/checklists/security/frontend.md": "ec0b78343ea058b13dfb7a33cee1d6d80b3b9f6713a601c75ad3e0b9df430a66",
+    ".github/actions/security-review/checklists/security/jwt-security.md": "f92bff6b3d2220cd77a2608592e7b11a8b37cdfd8523f3e6765c39e96bbdc804",
+    ".github/actions/security-review/checklists/security/owasp-2025.md": "6cd2c2abeef243326c1536717ad97446091985e62255e646371c8c7374af3572",
+    ".github/actions/security-review/checklists/security/timing-safe-compare.md": "360f26175fef51a527447b146cf30a5670ad69b920e61a6e6cb32262eece4e91",
+    ".github/actions/security-review/prompts/security.md": "28a3fe876a564efd4e185fd2eb251d1c70a485cbd6459f1846aad272e6d432fe",
+    ".github/actions/security-review/scripts/finalize-review.mjs": "6d7f66b22a9ac322add3e82c4d6db6aca85477114b2a1ce4ce65c649bed9ac9b",
+    ".github/actions/security-review/scripts/lib.mjs": "ee8fc2916e7f2f0f73bb0d398c963db7fc986fce5365b3a0eb209620e840836a",
+    ".github/actions/security-review/scripts/prepare-diff.mjs": "78d7655c9e51191d22d2b16cc782780046fd018f46c388b148b229528ac82280",
+    ".github/actions/security-review/scripts/render-prompt.mjs": "4b50e351e2122b806c862138d0303eb2e9c655f4e1e5d7ca8df372c360855a77",
+    ".github/workflows/security-review.yml": "01c7f11a3d911206757cb3fa7aa6de8e915d6eb5ca484bed9c74969e8aa4f093",
+    ".github/workflows/security-scans.yml": "77f0eeb6b50dfce906375180c82ab44aa07c760cc48512eb4e0c08ca0917f5f4"
+  }
+}
