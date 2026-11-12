@@ -1,0 +1,216 @@
+name: AI review
+description: >-
+  One AI review pass with the prompt and vendored checklists shipped in this action, so callers
+  need no extra token to read them. Expects the caller to have written full.diff, since.diff,
+  pr-description.md and review-context/ (repo rules from the base branch). Leaves <prefix>.json
+  (the review payload), <prefix>-meta.json and <prefix>-fixed.json in the workspace, and fails
+  rather than passes when Claude did not run or wrote nothing. The code review's prefix is
+  `review`, the security review's `security`.
+
+inputs:
+  reviewer:
+    description: Prompt to run (prompts/<reviewer>.md). The marker is <!-- ai-review:<marker> -->.
+    default: review
+  marker:
+    default: code
+  output_prefix:
+    description: >-
+      Names the files the reviewer writes: <prefix>-body.md, <prefix>-comments.json,
+      <prefix>-fixed.json and <prefix>-meta.json. The payload to post is <prefix>.json.
+    default: review
+  server_paths:
+    description: Globs of server code, for prompts that read the backend checklist only when the diff touches it.
+    default: ''
+  pr:
+    required: true
+  round:
+    required: true
+  round_cap:
+    default: '3'
+  since_from_round:
+    description: >-
+      The round from which pr-diff.txt holds only the changes since the last review. Empty means
+      round_cap (the code review); the security review, which has no cap, uses 2.
+    default: ''
+  commit_id:
+    description: The head SHA the review is for.
+    required: true
+  skip_paths:
+    description: Newline-separated globs dropped from the diff before review.
+    default: ''
+  risk_file:
+    description: Path to the base branch's .github/risk.yml, or empty. No file means every path is Medium.
+    default: ''
+  model:
+    default: claude-opus-5-5
+  max_turns:
+    default: '100'
+  claude_code_oauth_token:
+    required: true
+  allowed_bots:
+    description: >-
+      Bot accounts whose PRs are reviewed, comma-separated. claude-code-action refuses every
+      non-human actor otherwise, and bot PRs are reviewed, never skipped.
+    default: dependabot[bot]
+  github_token:
+    description: >-
+      Passed to claude-code-action so it skips its OIDC exchange with the Claude app. Without it the
+      action exits 0 on workflow_not_found_on_default_branch, which a reusable workflow called at a
+      tag can hit on every run.
+    required: true
+
+outputs:
+  tier:
+    value: ${{ steps.diff.outputs.tier }}
+  effort:
+    value: ${{ steps.diff.outputs.effort }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare the diff
+      id: diff
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        SKIP_PATHS: ${{ inputs.skip_paths }}
+        RISK_FILE: ${{ inputs.risk_file }}
+        ROUND: ${{ inputs.round }}
+        ROUND_CAP: ${{ inputs.round_cap }}
+        SINCE_FROM: ${{ inputs.since_from_round }}
+      run: |
+        set -euo pipefail
+        node "$ACTION_DIR/scripts/prepare-diff.mjs" full.diff "$RISK_FILE" "$SKIP_PATHS" since.diff "$ROUND" "${SINCE_FROM:-$ROUND_CAP}" > diff-info.json
+        cat diff-info.json; echo
+        # Effort scales with the path tier and is capped at high.
+        echo "tier=$(jq -r .tier diff-info.json)" >> "$GITHUB_OUTPUT"
+        echo "effort=$(jq -r .effort diff-info.json)" >> "$GITHUB_OUTPUT"
+        cp since.diff review-context/since-last-review.diff
+
+    - name: Render the prompt
+      id: prompt
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        REVIEWER: ${{ inputs.reviewer }}
+        PR: ${{ inputs.pr }}
+        REPO: ${{ github.repository }}
+        ROUND: ${{ inputs.round }}
+        SERVER_PATHS: ${{ inputs.server_paths }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -euo pipefail
+        [[ "$REVIEWER" =~ ^[a-z-]+$ ]] || { echo "::error::Bad reviewer name '$REVIEWER'."; exit 1; }
+        [[ "$PREFIX" =~ ^[a-z-]+$ ]] || { echo "::error::Bad output_prefix '$PREFIX'."; exit 1; }
+        mkdir -p review-context/checklists
+        # The shared checklists, plus the reviewer's own (checklists/<reviewer>/, e.g. security).
+        find "$ACTION_DIR/checklists" -maxdepth 1 -name '*.md' ! -name SOURCES.md -exec cp {} review-context/checklists/ \;
+        if [ -d "$ACTION_DIR/checklists/$REVIEWER" ]; then
+          cp "$ACTION_DIR/checklists/$REVIEWER"/*.md review-context/checklists/
+        fi
+        note=""
+        if [ "$(jq -r .scoped_to_since diff-info.json)" = true ]; then
+          note="This round, this file holds only the changes since your last review. Flag the class of each bug and list every instance."
+        fi
+        if [ "$(jq -r .truncated diff-info.json)" = true ]; then
+          note="$note It was cut at 400 KB, so it is incomplete: read the changed files from the checkout, and name what you could not cover on the Coverage line."
+        fi
+        if [ "$(jq '.skipped | length' diff-info.json)" != 0 ]; then
+          note="$note Files matching this repo's skip_paths were left out: $(jq -r '.skipped | join(", ")' diff-info.json)."
+        fi
+        jq -n --arg pr "$PR" --arg repo "$REPO" --arg round "$ROUND" --arg tier "$(jq -r .tier diff-info.json)" \
+          --rawfile pr_description pr-description.md --arg truncation_note "${note# }" \
+          --arg server_paths "$(printf '%s' "$SERVER_PATHS" | awk 'NF { printf "%s%s", sep, $0; sep=", " }')" \
+          '{pr: $pr, repo: $repo, round: $round, tier: $tier, pr_description: $pr_description, truncation_note: $truncation_note,
+            server_paths: (if $server_paths == "" then "none configured" else $server_paths end)}' \
+          > "$RUNNER_TEMP/ai-review-vars.json"
+        node "$ACTION_DIR/scripts/render-prompt.mjs" "$ACTION_DIR/prompts/$REVIEWER.md" "$RUNNER_TEMP/ai-review-vars.json" > "$RUNNER_TEMP/ai-review-prompt.md"
+        d="ghout_$(openssl rand -hex 16)"
+        { echo "prompt<<$d"; cat "$RUNNER_TEMP/ai-review-prompt.md"; echo "$d"; } >> "$GITHUB_OUTPUT"
+
+    # Red with the fix, rather than claude-code-action's "exited without running Claude". A
+    # Dependabot run reads Dependabot secrets only, so an Actions-only token is empty there.
+    - name: Check the OAuth token
+      shell: bash
+      env:
+        HAS_TOKEN: ${{ inputs.claude_code_oauth_token != '' }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        [ "$HAS_TOKEN" = true ] && exit 0
+        if [ "$ACTOR" = 'dependabot[bot]' ]; then
+          echo "::error::CLAUDE_CODE_OAUTH_TOKEN is empty on this Dependabot run: Dependabot runs only get Dependabot secrets. Add CLAUDE_CODE_OAUTH_TOKEN as an org Dependabot secret (org Settings > Secrets and variables > Dependabot), then re-run this job."
+        else
+          echo "::error::CLAUDE_CODE_OAUTH_TOKEN is empty. Pass it to the reusable workflow (secrets: CLAUDE_CODE_OAUTH_TOKEN), then re-run this job."
+        fi
+        exit 1
+
+    - name: Run Claude
+      id: claude
+      continue-on-error: true
+      uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        show_full_output: false
+        # Writing is limited to the four output files, so a prompt-injected run can't write to
+        # $GITHUB_ENV, $GITHUB_PATH or a script a later step runs. Edit(...) rules cover the Write
+        # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
+        # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
+        # output_prefix is checked to be [a-z-]+ in the prompt step.
+        claude_args: >-
+          --model ${{ inputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+        prompt: ${{ steps.prompt.outputs.prompt }}
+
+    - name: Check Claude ran and wrote a review
+      shell: bash
+      env:
+        BODY: ${{ inputs.output_prefix }}-body.md
+        CONCLUSION: ${{ steps.claude.outputs.conclusion }}
+        EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        OUTCOME: ${{ steps.claude.outcome }}
+      run: |
+        set -euo pipefail
+        # claude-code-action sets skipped_due_to_workflow_validation_mismatch on an internal step
+        # but doesn't declare it as an output (action.yml at 1d6de8cb), so it can't be read here.
+        # A skip returns before Claude runs and leaves conclusion and execution_file empty.
+        if [ -z "$CONCLUSION" ] || [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
+          echo "::error::claude-code-action exited without running Claude (step outcome: $OUTCOME). Usual" \
+               "causes: a workflow validation skip, or an invalid or rate-limited token. Re-run this job."
+          exit 1
+        fi
+        # Full output is hidden, so name any denied tools (names only, no inputs).
+        jq -r '.[] | select(.type == "result") | .permission_denials[]?.tool_name' "$EXECUTION_FILE" \
+          | sort | uniq -c | sed 's/^/Denied tool: /' || true
+        # The model sometimes ends with the review as its final message instead of writing the file.
+        # Use that text only if it opens with the summary line.
+        if [ ! -s "$BODY" ]; then
+          jq -r '[.[] | select(.type == "result")][-1].result // ""' "$EXECUTION_FILE" > result.md || true
+          if head -n 1 result.md | grep -Eq '^([0-9]+ important, [0-9]+ nits?|Nothing to fix\.|[0-9]+ security findings?, [0-9]+ hardening|No security findings\.)'; then
+            echo "Recovering the review body from the final message."
+            mv result.md "$BODY"
+          else
+            echo "Final message (first line): $(head -n 1 result.md | cut -c1-300)"
+          fi
+          rm -f result.md
+        fi
+        if [ ! -s "$BODY" ]; then
+          # A green check that reviewed nothing reads as "reviewed, all fine".
+          echo "::error::Claude wrote no review (Claude outcome: $CONCLUSION). Usual causes: the turn cap," \
+               "the step timeout, or a rate-limited token. Re-run this job; the check stays red until a review posts."
+          exit 1
+        fi
+
+    - name: Build the review and its meta
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        CTX: >-
+          {"marker": "<!-- ai-review:${{ inputs.marker }} -->", "round": ${{ inputs.round }},
+          "round_cap": ${{ inputs.round_cap }}, "commit_id": "${{ inputs.commit_id }}",
+          "prefix": "${{ inputs.output_prefix }}"}
+      run: |
+        set -euo pipefail
+        ctx=$(jq -c --slurpfile info diff-info.json '. + {truncated: $info[0].truncated, skipped: $info[0].skipped, tier: $info[0].tier}' <<<"$CTX")
+        node "$ACTION_DIR/scripts/finalize-review.mjs" "$ctx"
