@@ -1,0 +1,71 @@
+# tao funds-safety rules for Rust (tao-rust-sdk-v2, the signing library the extension ships as WASM).
+# All WARNING: reported, never blocking, until false positives on the SDK are measured
+# (Fable red-team #10). Tests: tests/funds-safety-rules/rust.rs.
+rules:
+  - id: tao-rust-unsafe
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      New `unsafe` code in a signing library. Check it can't read or write key material out of
+      bounds, and that the safety comment holds.
+    metadata: { category: memory-safety }
+    pattern-either:
+      - pattern: unsafe { ... }
+      - pattern: unsafe fn $F(...) { ... }
+      - pattern: unsafe fn $F(...) -> $R { ... }
+      - pattern: unsafe impl $T for $X { ... }
+
+  - id: tao-rust-secret-log
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      Key material passed to a print, log or format macro. Secrets must never reach logs, panics or
+      error strings.
+    metadata: { category: exfiltration }
+    pattern-regex: >-
+      \b(println|eprintln|print|eprint|dbg|panic|format|write|writeln|trace|debug|info|warn|error|log|event)!\s*\([^;]*?\b(secret|seed|mnemonic|private_key|priv_key|secret_key|sk|entropy|keypair|signing_key|seed_phrase)\b
+
+  - id: tao-rust-missing-zeroize
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      `$S` keeps key material ($F: $T) in a plain buffer without Zeroize/ZeroizeOnDrop, so it stays in
+      memory after use. Derive ZeroizeOnDrop or wrap the field in Zeroizing<_>/SecretBox<_>.
+    metadata: { category: key-hygiene }
+    patterns:
+      - pattern-either:
+          - pattern: |
+              struct $S { ..., $F: $T, ... }
+          - pattern: |
+              pub struct $S { ..., $F: $T, ... }
+      - metavariable-regex:
+          metavariable: $F
+          regex: '(?i)^(secret|seed|mnemonic|private_?key|priv_?key|secret_?key|entropy|sk|signing_?key|xprv|seed_?phrase)\w*$'
+      - metavariable-regex:
+          metavariable: $T
+          regex: '^(\[u8;.*\]|Vec<u8>|String|Box<\[u8\]>|Box<str>)$'
+      - pattern-not: |
+          #[derive(..., Zeroize, ...)]
+          struct $S { ... }
+      - pattern-not: |
+          #[derive(..., ZeroizeOnDrop, ...)]
+          struct $S { ... }
+
+  - id: tao-rust-secret-debug
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      `$S` holds key material and derives Debug, so `{:?}` anywhere prints it. Implement Debug by
+      hand and redact the field.
+    metadata: { category: key-hygiene }
+    patterns:
+      - pattern-either:
+          - pattern: |
+              #[derive(..., Debug, ...)]
+              struct $S { ..., $F: $T, ... }
+          - pattern: |
+              #[derive(..., Debug, ...)]
+              pub struct $S { ..., $F: $T, ... }
+      - metavariable-regex:
+          metavariable: $F
+          regex: '(?i)^(secret|seed|mnemonic|private_?key|priv_?key|secret_?key|entropy|sk|signing_?key|xprv|seed_?phrase)\w*$'

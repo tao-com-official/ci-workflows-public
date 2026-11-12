@@ -1,0 +1,310 @@
+# tao funds-safety rules for JavaScript and TypeScript. They look for code that could steal or
+# redirect user funds: dynamic code, secrets leaving the process, weak randomness, clipboard tricks,
+# and new outbound hosts. Address literals are checked on the diff by scripts/funds-safety.mjs,
+# which also covers JSON. Run only on what a change introduces
+# (--baseline-commit) with --disable-nosem; scripts/semgrep-report.mjs applies the repo's
+# base-branch .github/funds-safety.yml and decides what blocks.
+#
+# severity: ERROR blocks the check. WARNING is reported (job summary + annotation) and never blocks,
+# except where semgrep-report.mjs promotes it (see the rule's metadata.promote).
+# Tests: tests/funds-safety-rules/js.ts (`semgrep --test`, ci.yml).
+rules:
+  - id: tao-dynamic-code
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Runs code built at runtime (eval, Function, vm, importScripts or a string timer). In a wallet
+      this is the usual way to hide a payload that swaps recipients or exfiltrates keys. Use a static
+      import or a plain function.
+    metadata: { category: obfuscation }
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: $W.eval(...)
+      - pattern: new Function(...)
+      - pattern: Function(...)
+      - pattern: $W.Function(...)
+      - pattern: new $W.Function(...)
+      - pattern: vm.runInNewContext(...)
+      - pattern: vm.runInThisContext(...)
+      - pattern: vm.runInContext(...)
+      - pattern: vm.compileFunction(...)
+      - pattern: new vm.Script(...)
+      - pattern: importScripts(...)
+      - pattern: self.importScripts(...)
+      - pattern: setTimeout("...", ...)
+      - pattern: setInterval("...", ...)
+      - pattern: setTimeout($A + $B, ...)
+      - pattern: setInterval($A + $B, ...)
+      - pattern: $W.setTimeout("...", ...)
+      - pattern: $W.setInterval("...", ...)
+
+  - id: tao-remote-import
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Loads code from a URL or a computed specifier at runtime. Remote code can change after
+      review; bundle the module instead.
+    metadata: { category: remote-code }
+    pattern-either:
+      - patterns:
+          - pattern: import($SPEC)
+          - pattern-not: import("...")
+          # Bundler-resolved template specifiers with a fixed relative prefix are lazy chunks.
+          - pattern-not-regex: import\(\s*`\.{1,2}/
+      - patterns:
+          - pattern: import("$URL")
+          - metavariable-regex: { metavariable: $URL, regex: '^(https?:)?//' }
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  $EL = document.createElement("script");
+                  ...
+                  $EL.src = $SRC;
+              - pattern: |
+                  const $EL = document.createElement("script");
+                  ...
+                  $EL.src = $SRC;
+              - pattern: |
+                  let $EL = document.createElement("script");
+                  ...
+                  $EL.src = $SRC;
+      - pattern: new Worker("$URL", ...)
+      - patterns:
+          - pattern: $WA.instantiateStreaming(fetch(...), ...)
+          - metavariable-regex: { metavariable: $WA, regex: '^WebAssembly$' }
+
+  - id: tao-decode-then-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Decoded data reaches code execution (decode-then-exec), the classic way to smuggle a payload
+      past review.
+    metadata: { category: obfuscation }
+    mode: taint
+    pattern-sources:
+      - pattern: atob(...)
+      - pattern: Buffer.from($X, "base64")
+      - pattern: Buffer.from($X, "hex")
+      - pattern: Buffer.from($X, "base64url")
+      - pattern: String.fromCharCode(...)
+      - pattern: String.fromCodePoint(...)
+      - pattern: decodeURIComponent(...)
+      - pattern: unescape(...)
+      - pattern: (new TextDecoder(...)).decode(...)
+      - pattern: $D.decode(...)
+      - pattern: $X.split("").reverse().join("")
+    pattern-sinks:
+      - pattern: eval(...)
+      - pattern: Function(...)
+      - pattern: new Function(...)
+      - pattern: import(...)
+      - pattern: WebAssembly.instantiate(...)
+      - pattern: WebAssembly.compile(...)
+      - pattern: new WebAssembly.Module(...)
+      - patterns:
+          - pattern-inside: $EL.src = $X
+          - pattern: $X
+      - pattern: setTimeout($X, ...)
+      - pattern: setInterval($X, ...)
+      - pattern: vm.runInNewContext(...)
+      - pattern: vm.runInThisContext(...)
+
+  - id: tao-secret-sink
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A seed phrase, private key, password or other key material is passed to a call that sends,
+      posts, logs, reports, stores in plain text or copies it. Key material must stay inside the keyring/vault code and be encrypted
+      before it is stored.
+    metadata: { category: exfiltration }
+    mode: taint
+    options:
+      # A function's result isn't tainted by its arguments: deriving a key pair, address or
+      # signature from a seed is the wallet's job. Encoders that wrap a secret for sending are
+      # sources of their own (below).
+      taint_assume_safe_functions: true
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $NAME
+              - pattern: $OBJ.$NAME
+              - pattern: $OBJ?.$NAME
+          - metavariable-regex:
+              metavariable: $NAME
+              # Exact names, not substrings. Not `seed`, `sk` or `signature`: those are everywhere,
+              # and sending signatures is the product (Fable red-team #10).
+              regex: '(?i)^_*(mnemonics?|mnemonic_?(words|phrase)|seed_?phrase|secret_?phrase|recovery_?phrase|private_?keys?|private_?key_?(hex|bytes)|priv_?key|secret_?keys?|secret_?key_?(hex|bytes)|entropy|password|passphrase)$'
+      # A secret wrapped by an encoder: JSON.stringify({ mnemonic }), btoa(key), `new Error(seed)`…
+      - patterns:
+          - pattern-either:
+              - pattern: JSON.stringify(<... $NAME ...>, ...)
+              - pattern: String(<... $NAME ...>)
+              - pattern: btoa(<... $NAME ...>)
+              - pattern: encodeURIComponent(<... $NAME ...>)
+              - pattern: Buffer.from(<... $NAME ...>, ...)
+              - pattern: new URLSearchParams(<... $NAME ...>)
+              - pattern: new Error(<... $NAME ...>, ...)
+              - pattern: (<... $NAME ...>).toString(...)
+              - pattern: (<... $NAME ...>).join(...)
+              - pattern: (<... $NAME ...>).trim()
+              - pattern: (<... $NAME ...>).slice(...)
+              - pattern: (<... $NAME ...>).substring(...)
+              - pattern: (<... $NAME ...>).normalize(...)
+          - metavariable-regex:
+              metavariable: $NAME
+              # Exact names, not substrings. Not `seed`, `sk` or `signature`: those are everywhere,
+              # and sending signatures is the product (Fable red-team #10).
+              regex: '(?i)^_*(mnemonics?|mnemonic_?(words|phrase)|seed_?phrase|secret_?phrase|recovery_?phrase|private_?keys?|private_?key_?(hex|bytes)|priv_?key|secret_?keys?|secret_?key_?(hex|bytes)|entropy|password|passphrase)$'
+    pattern-sanitizers:
+      - pattern: encrypt(...)
+      - pattern: $X.encrypt(...)
+      - pattern: $X.encryptVault(...)
+      - pattern: hash(...)
+      - pattern: $X.hash(...)
+      - pattern: sha256(...)
+      - pattern: blake2AsHex(...)
+      - pattern: $X.length
+      - pattern: '!$X'
+      - pattern: '!!$X'
+      - pattern: typeof $X
+      - pattern: Boolean($X)
+      - pattern: $X.publicKey
+      - pattern: $X.address
+      - pattern: $X.ss58Address
+      - pattern: getPublicKey(...)
+      - pattern: $X.getPublicKey(...)
+      - pattern: $X === $Y
+      - pattern: $X !== $Y
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch(..., $ARG, ...)
+              - pattern: $X.fetch(..., $ARG, ...)
+              - pattern: axios(..., $ARG, ...)
+              - pattern: axios.$M(..., $ARG, ...)
+              - pattern: $HTTP.post(..., $ARG, ...)
+              - pattern: $HTTP.put(..., $ARG, ...)
+              - pattern: $HTTP.patch(..., $ARG, ...)
+              - pattern: $XHR.send(..., $ARG, ...)
+              - pattern: $WS.send(..., $ARG, ...)
+              - pattern: navigator.sendBeacon(..., $ARG, ...)
+              - pattern: postMessage(..., $ARG, ...)
+              - pattern: $W.postMessage(..., $ARG, ...)
+              - pattern: chrome.runtime.sendMessage(..., $ARG, ...)
+              - pattern: chrome.tabs.sendMessage(..., $ARG, ...)
+              - pattern: browser.runtime.sendMessage(..., $ARG, ...)
+              - pattern: console.$M(..., $ARG, ...)
+              - pattern: logger.$M(..., $ARG, ...)
+              - pattern: $L.logger.$M(..., $ARG, ...)
+              - pattern: log.$M(..., $ARG, ...)
+              - pattern: Sentry.$M(..., $ARG, ...)
+              - pattern: newrelic.$M(..., $ARG, ...)
+              - pattern: $NR.noticeError(..., $ARG, ...)
+              - pattern: $NR.addPageAction(..., $ARG, ...)
+              - pattern: $NR.setCustomAttribute(..., $ARG, ...)
+              - pattern: analytics.$M(..., $ARG, ...)
+              - pattern: posthog.$M(..., $ARG, ...)
+              - pattern: $T.track(..., $ARG, ...)
+              - pattern: localStorage.setItem(..., $ARG, ...)
+              - pattern: sessionStorage.setItem(..., $ARG, ...)
+              - pattern: window.localStorage.setItem(..., $ARG, ...)
+              - pattern: AsyncStorage.setItem(..., $ARG, ...)
+              - pattern: AsyncStorage.mergeItem(..., $ARG, ...)
+              - pattern: chrome.storage.local.set(..., $ARG, ...)
+              - pattern: chrome.storage.sync.set(..., $ARG, ...)
+              - pattern: navigator.clipboard.writeText(..., $ARG, ...)
+              - pattern: Clipboard.setString(..., $ARG, ...)
+              - pattern: Clipboard.setStringAsync(..., $ARG, ...)
+              - pattern: $MMKV.set(..., $ARG, ...)
+          # The argument itself must carry the secret, not something derived from it inside
+          # another call (getAddress(privateKey) is fine to log).
+          - focus-metavariable: $ARG
+      - patterns:
+          - pattern-inside: document.cookie = $X
+          - pattern: $X
+
+  - id: tao-weak-rng
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Math.random() isn't a cryptographic RNG. In key, seed, nonce, salt or signing code use
+      crypto.getRandomValues (or the platform's secure RNG).
+    metadata:
+      category: weak-crypto
+      # semgrep-report.mjs blocks this inside the repo's crypto_paths.
+      promote: crypto
+    pattern-either:
+      - pattern: Math.random()
+      - pattern: seedrandom(...)
+      - pattern: new Chance(...)
+
+  - id: tao-clipboard-hijack
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Rewrites what the user copies or pastes. A clipboard swapper replaces a copied address with an
+      attacker's.
+    metadata: { category: clipboard }
+    pattern-either:
+      # A copy/cut/paste listener that writes clipboard data, however deeply nested.
+      - patterns:
+          - pattern-either:
+              - pattern: $T.addEventListener("copy", $H, ...)
+              - pattern: $T.addEventListener("cut", $H, ...)
+              - pattern: $T.addEventListener("paste", $H, ...)
+              - pattern: $T.oncopy = $H
+              - pattern: $T.oncut = $H
+          - metavariable-pattern:
+              metavariable: $H
+              pattern-either:
+                - pattern: <... $D.setData(...) ...>
+                - pattern: <... $D?.setData(...) ...>
+      # Reads the clipboard, then writes it back.
+      - patterns:
+          - pattern-either:
+              - pattern: navigator.clipboard.writeText(...)
+              - pattern: Clipboard.setString(...)
+              - pattern: Clipboard.setStringAsync(...)
+          - pattern-either:
+              - pattern-inside: |
+                  $V = await navigator.clipboard.readText();
+                  ...
+              - pattern-inside: |
+                  const $V = await navigator.clipboard.readText();
+                  ...
+              - pattern-inside: |
+                  const $V = await Clipboard.getStringAsync(...);
+                  ...
+              - pattern-inside: |
+                  const $V = await Clipboard.getString();
+                  ...
+
+  - id: tao-clipboard-write
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      New clipboard write. Check that what is copied is exactly the value shown to the user (an
+      address copied from a different variable than the one displayed is a swap).
+    metadata: { category: clipboard }
+    pattern-either:
+      - pattern: navigator.clipboard.writeText(...)
+      - pattern: navigator.clipboard.write(...)
+      - pattern: Clipboard.setString(...)
+      - pattern: Clipboard.setStringAsync(...)
+      - pattern: document.execCommand("copy")
+      - pattern: $E.clipboardData.setData(...)
+      - pattern: $E.clipboardData?.setData(...)
+
+  - id: tao-outbound-host
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      URL literal. semgrep-report.mjs checks its host against the repo's allowed_hosts; a new host
+      that requests are sent to blocks.
+    metadata:
+      category: outbound-host
+      promote: host
+    pattern-either:
+      - patterns:
+          - pattern: '"$S"'
+          - metavariable-regex: { metavariable: $S, regex: '^(https?|wss?)://[^/\s]+' }

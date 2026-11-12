@@ -1,0 +1,12 @@
+# Written over the repo's own .semgrepignore by the funds-safety action: a PR can't exclude its own
+# files. Only tests, specs and stories are skipped (not mocks/ or fixtures/, which production code can
+# import). Keep in step with TEST_GLOBS in scripts/common.mjs.
+node_modules/
+*.test.*
+*.spec.*
+*.stories.*
+*.e2e.*
+e2e/
+tests/
+__tests__/
+__snapshots__/
