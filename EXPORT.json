@@ -7,10 +7,10 @@
     "public_action_commit": "1562989174dedba79d801c95bfbfa8d6c64452a1"
   },
   "security_scans": {
-    "ref": "security-scans-v0.2.0",
-    "commit": "fa262cf15306ab010aab242676bf7bfb989707e7",
-    "funds_safety_action_commit": "807443d15ecd9bc57815abc09a2722bf7f36c2c1",
-    "public_funds_safety_action_commit": "1562989174dedba79d801c95bfbfa8d6c64452a1"
+    "ref": "security-scans-v0.2.1",
+    "commit": "24358ef16ef153e3b9f23dc44cadb3e108b16177",
+    "funds_safety_action_commit": "7dd55f9cd256e43c3c1350f9752a29c43fe12df7",
+    "public_funds_safety_action_commit": "713d6b97eb96534bc5821fffaaf0696c7b2754f1"
   },
   "files": {
     ".github/actions/funds-safety/action.yml": "f987464d1fafb3ec714df5d8e13addb249e67c72f7230fb9aaf2bfa9f9866177",
@@ -18,7 +18,7 @@
     ".github/actions/funds-safety/rules/rust.yml": "6f620b3fb19e3bfea91fc664b6b9b956c66bafa5a4d6881b6035beb42b2570c6",
     ".github/actions/funds-safety/scripts/common.mjs": "1e420749390f6bb8275ab59202ee157b7d78025d0a6a127e8bfe51ccafc802fb",
     ".github/actions/funds-safety/scripts/dep-diff.mjs": "ae8f9819320fdfdb4b97ae8f5142274b3462776ad0b6e67eb15bc6e04d812f28",
-    ".github/actions/funds-safety/scripts/dependencies.mjs": "f9e5e4a421ff996e2ca663e3c6330bb6a6031865586a168052682db1920826eb",
+    ".github/actions/funds-safety/scripts/dependencies.mjs": "226624879a93927c9811e68cabee2396bc1f50b4c2f4128ae0dbf9ebd985d50f",
     ".github/actions/funds-safety/scripts/funds-safety.mjs": "e8e13fb35df70597bc1c262930b76d0a5b4162e7167d7a34ba335c79c1f6ebe5",
     ".github/actions/funds-safety/scripts/guarddog.mjs": "73ced2e0ce8c5cfdb94f6ebc92981f94ee0b100d8e5e8a69fdafae45f6aef9cf",
     ".github/actions/funds-safety/scripts/lavamoat.mjs": "c9f5bbdb4ac437c918709d62897030cbb6280857468b799d2d828b5097eccf89",
@@ -37,6 +37,6 @@
     ".github/actions/security-review/scripts/prepare-diff.mjs": "78d7655c9e51191d22d2b16cc782780046fd018f46c388b148b229528ac82280",
     ".github/actions/security-review/scripts/render-prompt.mjs": "4b50e351e2122b806c862138d0303eb2e9c655f4e1e5d7ca8df372c360855a77",
     ".github/workflows/security-review.yml": "306f749b7827fa5733fb4675a63280b58290c78c2343b518259dced19c937c9f",
-    ".github/workflows/security-scans.yml": "a32e24e1c3a8e931fc1f230deb2054e3ffb819180fc6f514e19806addee67e57"
+    ".github/workflows/security-scans.yml": "03c58a753a19545360a5241f0ad4286a7ac95ffc7fd27bdcff16cc23f4c00f5b"
   }
 }
