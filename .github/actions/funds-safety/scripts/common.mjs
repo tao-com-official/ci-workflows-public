@@ -124,7 +124,13 @@ export async function findApproval({ repo, pr, token, approvers }) {
     for (const who of [c.author?.login, c.committer?.login]) if (who && who !== 'web-flow') involved.add(who.toLowerCase());
   }
   const reviews = await ghAll(`/repos/${repo}/pulls/${pr}/reviews`, token);
-  const ok = reviews.find(
+  // Each reviewer's latest decisive review counts, as on GitHub: a later CHANGES_REQUESTED or a
+  // dismissal withdraws an earlier approval. Comment-only reviews don't change it.
+  const latest = new Map();
+  for (const r of reviews) {
+    if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(r.state)) latest.set(r.user.login.toLowerCase(), r);
+  }
+  const ok = [...latest.values()].find(
     (r) => r.state === 'APPROVED' && r.commit_id === head && approvers.includes(r.user.login.toLowerCase()) && !involved.has(r.user.login.toLowerCase()),
   );
   return ok

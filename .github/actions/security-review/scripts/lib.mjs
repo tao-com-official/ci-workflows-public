@@ -1,8 +1,10 @@
 // Small helpers shared by the review scripts. No dependencies: the runner has only node.
 
-// Glob → RegExp: `**` crosses directories, `*` and `?` don't, `{a,b}` alternates.
+// Glob → RegExp: `**` crosses directories, `*` and `?` don't, `{a,b}` alternates (wildcards and
+// nested braces inside work too). Same rules as funds-safety's and risk-gate's copies.
 export function globToRegExp(glob) {
   let re = '';
+  let braces = 0;
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i];
     if (ch === '*') {
@@ -14,11 +16,10 @@ export function globToRegExp(glob) {
         } else re += '.*';
       } else re += '[^/]*';
     } else if (ch === '?') re += '[^/]';
-    else if (ch === '{') {
-      const end = glob.indexOf('}', i);
-      re += `(?:${glob.slice(i + 1, end).split(',').map((s) => s.replace(/[.+^$()|[\]\\]/g, '\\$&')).join('|')})`;
-      i = end;
-    } else re += ch.replace(/[.+^$()|[\]\\]/g, '\\$&');
+    else if (ch === '{') (braces++, (re += '(?:'));
+    else if (ch === '}' && braces) (braces--, (re += ')'));
+    else if (ch === ',' && braces) re += '|';
+    else re += ch.replace(/[.+^$()|[\]{}\\]/g, '\\$&');
   }
   // The globs come from the repo's own config on the base branch (risk.yml, skip_paths), not from
   // the PR, and every regex metacharacter outside * ? {} is escaped above.

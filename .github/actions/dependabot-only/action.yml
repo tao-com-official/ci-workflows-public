@@ -1,0 +1,51 @@
+name: dependabot-only
+description: >-
+  Whether a pull request is Dependabot's alone and changes dependency files only, and the app's
+  Dependabot review stands in for this check (DEPENDABOT_READY_CHECKS names it, and its status on the
+  head is success), so the shared AI reviews can pass without calling Claude. No AI, no checkout. Called by claude-review.yml and security-review.yml pinned to a commit; not meant
+  for direct use.
+
+inputs:
+  pr:
+    description: The pull request number.
+    required: true
+  github_token:
+    description: Reads the PR, its commits, its files and the head's statuses.
+    required: true
+  check:
+    description: The required check this decides for, e.g. `claude-review / review`.
+    required: true
+  ready_checks:
+    description: >-
+      The app's DEPENDABOT_READY_CHECKS (comma-separated check names). The Dependabot review stands in
+      only for a check named here, as in the app's dependabot-review.yml. Empty: never.
+    required: false
+    default: ''
+  wait_seconds:
+    description: How long to wait for the `Dependabot review` status to leave pending.
+    required: false
+    default: '600'
+
+outputs:
+  only:
+    description: "'true' when the PR is Dependabot's alone and changes only dependency files."
+    value: ${{ steps.check.outputs.only }}
+  why:
+    description: Why it is or isn't, for the log.
+    value: ${{ steps.check.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - name: Is this a Dependabot-only dependency PR?
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR: ${{ inputs.pr }}
+        REPO: ${{ github.repository }}
+        ACTION_PATH: ${{ github.action_path }}
+        CHECK: ${{ inputs.check }}
+        READY_CHECKS: ${{ inputs.ready_checks }}
+        WAIT_SECONDS: ${{ inputs.wait_seconds }}
+      run: node "$ACTION_PATH/scripts/dependabot-only.mjs"
