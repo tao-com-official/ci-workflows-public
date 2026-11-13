@@ -43,6 +43,14 @@ inputs:
     default: ''
   model:
     default: claude-opus-5-5
+  model_low:
+    description: The model on Low tier PRs. Empty means `model` at every tier.
+    default: ''
+  effort:
+    description: >-
+      Claude's effort at every tier. Empty means it follows the path tier: medium on Low, high
+      otherwise.
+    default: ''
   max_turns:
     default: '100'
   claude_code_oauth_token:
@@ -64,6 +72,9 @@ outputs:
     value: ${{ steps.diff.outputs.tier }}
   effort:
     value: ${{ steps.diff.outputs.effort }}
+  model:
+    description: The model the review ran with.
+    value: ${{ steps.diff.outputs.model }}
 
 runs:
   using: composite
@@ -78,13 +89,28 @@ runs:
         ROUND: ${{ inputs.round }}
         ROUND_CAP: ${{ inputs.round_cap }}
         SINCE_FROM: ${{ inputs.since_from_round }}
+        MODEL: ${{ inputs.model }}
+        MODEL_LOW: ${{ inputs.model_low }}
+        EFFORT: ${{ inputs.effort }}
       run: |
         set -euo pipefail
         node "$ACTION_DIR/scripts/prepare-diff.mjs" full.diff "$RISK_FILE" "$SKIP_PATHS" since.diff "$ROUND" "${SINCE_FROM:-$ROUND_CAP}" > diff-info.json
         cat diff-info.json; echo
-        # Effort scales with the path tier and is capped at high.
-        echo "tier=$(jq -r .tier diff-info.json)" >> "$GITHUB_OUTPUT"
-        echo "effort=$(jq -r .effort diff-info.json)" >> "$GITHUB_OUTPUT"
+        # Unless the caller sets them, the model is `model` and effort scales with the path tier
+        # (capped at high). model_low replaces the model on Low tier PRs. Both go into claude_args,
+        # so only plain names pass.
+        tier=$(jq -r .tier diff-info.json)
+        effort=${EFFORT:-$(jq -r .effort diff-info.json)}
+        model=$MODEL
+        if [ "$tier" = Low ] && [ -n "$MODEL_LOW" ]; then model=$MODEL_LOW; fi
+        [[ "$model" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || { echo "::error::model '$model' isn't a model name."; exit 1; }
+        case "$effort" in low|medium|high|xhigh|max) ;; *) echo "::error::effort '$effort' isn't low, medium, high, xhigh or max."; exit 1 ;; esac
+        echo "Tier $tier: $model at effort $effort."
+        {
+          echo "tier=$tier"
+          echo "effort=$effort"
+          echo "model=$model"
+        } >> "$GITHUB_OUTPUT"
         cp since.diff review-context/since-last-review.diff
 
     - name: Render the prompt
@@ -158,8 +184,61 @@ runs:
         # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
         # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
         # output_prefix is checked to be [a-z-]+ in the prompt step.
+        # --tools loads only these built-in tools (Write creates the four files; the Edit rules above
+        # still confine it). --setting-sources user turns project memory off: no CLAUDE.md, no
+        # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
+        # (the action restores those from the base branch). The base-branch rules reach the reviewer
+        # through review-context/ instead. --disable-slash-commands drops the built-in skills.
         claude_args: >-
-          --model ${{ inputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
+          --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+        prompt: ${{ steps.prompt.outputs.prompt }}
+
+    # A throttled token fails within a second with no model usage; one retry a minute later
+    # usually runs. A failure after the model ran isn't retried (scripts/instant-failure.mjs).
+    - name: Retry an instant failure?
+      id: instant
+      if: steps.claude.outcome == 'failure'
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        OUTCOME: ${{ steps.claude.outcome }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -euo pipefail
+        node "$ACTION_DIR/scripts/instant-failure.mjs" "$OUTCOME" "${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+        if grep -qx 'retry=true' "$GITHUB_OUTPUT"; then
+          # Nothing the first run wrote may be read as the retry's.
+          rm -f "$PREFIX-body.md" "$PREFIX-comments.json" "$PREFIX-fixed.json" "$PREFIX-meta.json"
+          # 60-90 s, so PRs throttled together don't all retry together.
+          sleep $((60 + RANDOM % 31))
+        fi
+
+    - name: Run Claude again
+      id: claude_retry
+      if: steps.instant.outputs.retry == 'true'
+      continue-on-error: true
+      uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        show_full_output: false
+        # Writing is limited to the four output files, so a prompt-injected run can't write to
+        # $GITHUB_ENV, $GITHUB_PATH or a script a later step runs. Edit(...) rules cover the Write
+        # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
+        # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
+        # output_prefix is checked to be [a-z-]+ in the prompt step.
+        # --tools loads only these built-in tools (Write creates the four files; the Edit rules above
+        # still confine it). --setting-sources user turns project memory off: no CLAUDE.md, no
+        # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
+        # (the action restores those from the base branch). The base-branch rules reach the reviewer
+        # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        claude_args: >-
+          --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
           --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
         prompt: ${{ steps.prompt.outputs.prompt }}
 
@@ -167,22 +246,36 @@ runs:
       shell: bash
       env:
         BODY: ${{ inputs.output_prefix }}-body.md
-        CONCLUSION: ${{ steps.claude.outputs.conclusion }}
-        EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
-        OUTCOME: ${{ steps.claude.outcome }}
+        CONCLUSION_1: ${{ steps.claude.outputs.conclusion }}
+        EXECUTION_FILE_1: ${{ steps.claude.outputs.execution_file }}
+        OUTCOME_1: ${{ steps.claude.outcome }}
+        CONCLUSION_2: ${{ steps.claude_retry.outputs.conclusion }}
+        EXECUTION_FILE_2: ${{ steps.claude_retry.outputs.execution_file }}
+        OUTCOME_2: ${{ steps.claude_retry.outcome }}
+        RETRIED: ${{ steps.instant.outputs.retry == 'true' }}
       run: |
         set -euo pipefail
+        # The retry's outputs replace the first run's, which failed.
+        if [ "$RETRIED" = true ]; then n=2; else n=1; fi
+        CONCLUSION=$(printenv "CONCLUSION_$n" || true)
+        EXECUTION_FILE=$(printenv "EXECUTION_FILE_$n" || true)
+        OUTCOME=$(printenv "OUTCOME_$n" || true)
+        if [ "$RETRIED" = true ]; then echo "Using the retry (the first run failed instantly)."; fi
         # claude-code-action sets skipped_due_to_workflow_validation_mismatch on an internal step
         # but doesn't declare it as an output (action.yml at 1d6de8cb), so it can't be read here.
         # A skip returns before Claude runs and leaves conclusion and execution_file empty.
         if [ -z "$CONCLUSION" ] || [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
           echo "::error::claude-code-action exited without running Claude (step outcome: $OUTCOME). Usual" \
-               "causes: a workflow validation skip, or an invalid or rate-limited token. Re-run this job."
+               "causes: a workflow validation skip, or an invalid or rate-limited token (an instant failure was" \
+               "already retried once). Re-run this job."
           exit 1
         fi
         # Full output is hidden, so name any denied tools (names only, no inputs).
         jq -r '.[] | select(.type == "result") | .permission_denials[]?.tool_name' "$EXECUTION_FILE" \
           | sort | uniq -c | sed 's/^/Denied tool: /' || true
+        # What Claude loaded and what the run used: names, counts and token totals only.
+        jq -c '.[] | select(.type == "system" and .subtype == "init") | {model, tools, mcp_servers: [.mcp_servers[]?.name], skills, slash_commands}' "$EXECUTION_FILE" | sed 's/^/Loaded: /' || true
+        jq -c '[.[] | select(.type == "result")][-1] | {num_turns, total_cost_usd, usage: (.usage // {} | {input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens})}' "$EXECUTION_FILE" | sed 's/^/Used: /' || true
         # The model sometimes ends with the review as its final message instead of writing the file.
         # Use that text only if it opens with the summary line.
         if [ ! -s "$BODY" ]; then

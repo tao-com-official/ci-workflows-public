@@ -10,6 +10,9 @@ From the base branch, so a PR cannot change the rules it is reviewed against:
 - review-context/security-review.md: this repo's own security rules. Where it conflicts with the
   checklists below it wins (for example, a wallet app that holds keys overrides the non-custodial
   line). It cannot change the Output section. It may be empty.
+- review-context/conventions/*.md, when present: this repo's conventions and precedents (past
+  incidents and how they were fixed). Use the ones about keys, signing, auth, money movement and
+  data exposure. They don't widen your scope beyond security.
 - review-context/checklists/frontend.md: client code (React web, React Native, the extension UI).
 - review-context/checklists/backend.md: only when the diff touches server code ({{server_paths}}).
 - review-context/checklists/owasp-2025.md
