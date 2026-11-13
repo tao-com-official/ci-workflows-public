@@ -26,6 +26,14 @@ name: security-review
 on:
   workflow_call:
     inputs:
+      dependabot_ready_checks:
+        description: >-
+          Pass vars.DEPENDABOT_READY_CHECKS. A Dependabot-only dependency PR passes this check without
+          Claude only when that list names `security-review / review` and the head's `Dependabot review` status is
+          success, the same rule as the app's dependabot-review.yml. Empty (the default): the AI
+          review runs on Dependabot PRs as on any other.
+        type: string
+        default: ''
       # Standalone: for callers that don't run the code review (the public SDKs). The security
       # review then runs at once on every PR push, and the review_* inputs are ignored.
       standalone:
@@ -65,10 +73,29 @@ on:
         description: Newline-separated globs of server code. The backend checklist applies only to these.
         type: string
         default: ''
+      conventions_dir:
+        description: >-
+          Base-branch folder whose *.md files are the repo's conventions and precedents, as for the
+          code review. The security reviewer reads them for security-relevant precedents only.
+        type: string
+        default: ''
       skip_paths:
         description: Newline-separated globs left out of the diff the reviewer reads.
         type: string
         default: ''
+      debounce_seconds:
+        description: >-
+          Seconds to wait before the AI step on a push to a ready PR (pull_request synchronize). If
+          the PR's head moved in that time, the run stops without calling the model. 0 turns the
+          wait off.
+        type: number
+        default: 120
+      allowed_bots:
+        description: >-
+          Bot accounts, comma-separated, whose PRs are reviewed. claude-code-action refuses every
+          other non-human actor, so a PR opened by an app no one listed gets no review (a red check).
+        type: string
+        default: dependabot[bot]
       runs_on:
         type: string
         default: ubuntu-24.04
@@ -137,6 +164,62 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           rm -f pr.json
 
+      # A Dependabot PR that changes only dependency files is left to the repo's own Dependabot
+      # review, as in the code review. The label or "@claude review this" still runs this one.
+      - name: Dependabot-only dependency PR?
+        id: dependabot
+        if: >-
+          github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' &&
+          inputs.dependabot_ready_checks != '' &&
+          steps.pr.outputs.labelled != 'true'
+        uses: tao-com-official/ci-workflows-public/.github/actions/dependabot-only@f387e8af0776130d06e4544afb352d7622aee810 # exported from ci-workflows security-review-v0.3.6
+        with:
+          pr: ${{ steps.pr.outputs.number }}
+          github_token: ${{ github.token }}
+          check: security-review / review
+          ready_checks: ${{ inputs.dependabot_ready_checks }}
+
+      # The classifier's verdict for the head SHA, read only where a Low result could skip this
+      # review: a push whose code review passed on the head with no Important findings, on a Low
+      # path floor, without the label. Low means the verdict says floor low, tier low and no person
+      # needed; review_tier alone isn't enough (the caller passes it, and it omits the gate's
+      # built-in High paths and a rename's old path). The artifact can lag the classify job, so it's
+      # looked for for up to 2 minutes; still missing, the review runs.
+      - name: Read the classifier verdict
+        id: classifier
+        if: >-
+          github.event_name == 'pull_request' && inputs.review_tier == 'Low' &&
+          inputs.review_result == 'success' && inputs.review_commit_sha == steps.pr.outputs.head_sha &&
+          inputs.review_important == '0' && steps.pr.outputs.labelled != 'true' &&
+          steps.dependabot.outputs.only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.pr.outputs.head_sha }}
+          WAIT_SECONDS: '120'
+        run: |
+          set -uo pipefail
+          default_branch=$(gh api "repos/$REPO" -q .default_branch) || default_branch=main
+          # Trusted only from a run of this repo (not a fork) for this SHA, or the default branch.
+          url=""
+          for _ in $(seq 0 15 "$WAIT_SECONDS"); do
+            url=$(gh api "repos/$REPO/actions/artifacts?name=risk-classifier-$SHA&per_page=100" \
+              -q "[.artifacts[] | select((.expired | not) and .workflow_run.head_repository_id == .workflow_run.repository_id and (.workflow_run.head_sha == \"$SHA\" or .workflow_run.head_branch == \"$default_branch\"))][0].archive_download_url // \"\"") || url=""
+            [ -n "$url" ] && break
+            sleep 15
+          done
+          low=false
+          if [ -z "$url" ]; then
+            echo "No classifier verdict for ${SHA:0:7} after ${WAIT_SECONDS}s; the security review runs."
+          elif gh api "$url" > verdict.zip && unzip -o -q verdict.zip -d verdict && [ -s verdict/risk.json ]; then
+            jq -c '{floor, tier, needs_person}' verdict/risk.json | sed 's/^/Classifier verdict: /'
+            if jq -e '.floor == "low" and .tier == "low" and .needs_person == false' verdict/risk.json > /dev/null; then low=true; fi
+          else
+            echo "Couldn't read the classifier verdict for ${SHA:0:7}; the security review runs."
+          fi
+          rm -rf verdict verdict.zip
+          echo "low=$low" >> "$GITHUB_OUTPUT"
+
       # Decides from env alone (tests/security-review.test.mjs runs this block). Exit 1 is the
       # "waits" failure; run=false with exit 0 is a pass-through.
       - name: Is it time for the security review?
@@ -155,6 +238,9 @@ jobs:
           STANDALONE: ${{ inputs.standalone }}
           CROSS_REPO: ${{ steps.pr.outputs.cross_repo }}
           HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          DEPENDABOT_ONLY: ${{ steps.dependabot.outputs.only }}
+          DEPENDABOT_WHY: ${{ steps.dependabot.outputs.why }}
+          CLASSIFIER_LOW: ${{ steps.classifier.outputs.low }}
         run: |
           set -euo pipefail
           pass() { echo "::notice title=security-review passes through::$1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -169,6 +255,11 @@ jobs:
             echo "::error title=No security review on a fork's pull request::A maintainer must read the diff (especially .github/), push this branch into this repository and open a pull request from it; that one gets the security review."
             exit 1
           fi
+          # Dependabot's own dependency PRs are reviewed by the repo's Dependabot review; checked
+          # before the token, since a Dependabot run may have no Dependabot secrets.
+          if [ "$EVENT" = pull_request ] && [ "$LABELLED" != true ] && [ "${DEPENDABOT_ONLY:-}" = true ]; then
+            pass "Left to the Dependabot review: Dependabot-only PR, dependency files only (${DEPENDABOT_WHY:-checked}). See the \`Dependabot review\` status; \`@claude review this\` or the label $LABEL runs an AI security review."
+          fi
           if [ "$HAS_TOKEN" != true ]; then
             echo "::error title=No security review without the Claude token::This run has no CLAUDE_CODE_OAUTH_TOKEN, as on a pull request from a fork or a Dependabot PR without Dependabot secrets. A maintainer must push the branch into this repository (or re-run it there) to get a security review."
             exit 1
@@ -179,6 +270,12 @@ jobs:
           elif [ "$REVIEW_TIER" = High ]; then why="the path floor is High"
           elif [ "$REVIEW_RESULT" = success ] && [ "$REVIEW_SHA" = "$HEAD_SHA" ] && [ "$REVIEW_IMPORTANT" = 0 ]; then
             why="the code review of ${HEAD_SHA:0:7} has no open Important findings"
+          fi
+          # Low risk: all paths Low and the classifier agreed for this SHA. Only where the review was
+          # about to run because the code review passed; a request or the label always runs it.
+          if [ "$EVENT" = pull_request ] && [ "${CLASSIFIER_LOW:-}" = true ] && [ "$LABELLED" != true ] && [ "$STANDALONE" != true ] \
+             && [ "$REVIEW_TIER" = Low ] && [ "$why" = "the code review of ${HEAD_SHA:0:7} has no open Important findings" ]; then
+            pass "No security review: ${HEAD_SHA:0:7} is Low risk (all paths Low, classifier agreed). Add the label $LABEL to run one."
           fi
           if [ -n "$why" ]; then
             echo "Running the security review: $why."
@@ -211,13 +308,17 @@ jobs:
           PR: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          CONVENTIONS_DIR: ${{ inputs.conventions_dir }}
           MARKER: '<!-- ai-review:security -->'
         run: |
           set -euo pipefail
           # Nothing the PR committed may pose as an input or an output, or as Claude's settings.
           rm -rf review-context pr-diff.txt full.diff since.diff pr-description.md diff-info.json \
                  security-body.md security-comments.json security-fixed.json security-meta.json security.json \
-                 .claude/settings.json .claude/settings.local.json .mcp.json
+                 .claude .mcp.json
+          # Nor may it steer its own review: no CLAUDE.md at any depth. The action restores the root
+          # one and .claude/ from the base branch, and the AI step turns project memory off anyway.
+          find . -path ./.git -prune -o \( -name CLAUDE.md -o -name CLAUDE.local.md \) -type f -print0 | xargs -0 rm -f
           mkdir -p review-context
           echo "commit_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
 
@@ -262,6 +363,12 @@ jobs:
             fetch --no-tags --depth=1 "https://github.com/${REPO}.git" "$base_ref"
           git show FETCH_HEAD:.github/security-review.md > review-context/security-review.md 2>/dev/null \
             || : > review-context/security-review.md
+          if [ -n "$CONVENTIONS_DIR" ]; then
+            mkdir -p review-context/conventions
+            git ls-tree -r --name-only FETCH_HEAD -- "$CONVENTIONS_DIR" | { grep '\.md$' || true; } | while read -r f; do
+              git show "FETCH_HEAD:$f" > "review-context/conventions/$(basename "$f")"
+            done
+          fi
           git show FETCH_HEAD:.github/risk.yml > risk.yml 2>/dev/null || rm -f risk.yml
 
           # Inline findings already posted, as `[comment-id] path:line — first line`.
@@ -283,11 +390,38 @@ jobs:
             rm -f since.full.diff
           fi
 
+      # Pushes often land a minute or two apart, and cancel-in-progress only saves the tokens a run
+      # hasn't spent yet. So on a push, wait here, after the gate and the reuse check and before the
+      # AI. Cancelling isn't enough on its own: staged, the newer run's security job only joins the
+      # group once its code review is done, so this run also checks the head after the wait and
+      # stops, failing, if a newer push replaced it. That run reviews the new head. Nothing else
+      # waits: opened, ready_for_review, a label, "@claude review this" and the merge queue.
+      - name: Wait for a follow-up push
+        if: >-
+          steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false' &&
+          inputs.debounce_seconds > 0 &&
+          github.event_name == 'pull_request' && github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          DEBOUNCE_SECONDS: ${{ inputs.debounce_seconds }}
+        run: |
+          set -euo pipefail
+          sleep "$DEBOUNCE_SECONDS"
+          head=$(gh pr view "$PR" -R "$REPO" --json headRefOid -q .headRefOid)
+          if [ "$head" != "$HEAD_SHA" ]; then
+            echo "::error title=Replaced by a newer push::The head moved from ${HEAD_SHA:0:7} to ${head:0:7} while this run waited, so it stops before the AI. The run for ${head:0:7} reviews it."
+            exit 1
+          fi
+
       - name: Security review
         id: review
         if: steps.gate.outputs.run == 'true' && steps.fetch.outputs.reuse == 'false'
-        uses: tao-com-official/ci-workflows-public/.github/actions/security-review@1562989174dedba79d801c95bfbfa8d6c64452a1 # exported from ci-workflows security-review-v0.3.0
+        uses: tao-com-official/ci-workflows-public/.github/actions/security-review@f387e8af0776130d06e4544afb352d7622aee810 # exported from ci-workflows security-review-v0.3.6
         with:
+          allowed_bots: ${{ inputs.allowed_bots }}
           reviewer: security
           marker: security
           output_prefix: security

@@ -233,7 +233,7 @@ jobs:
             *) echo "sha=" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@713d6b97eb96534bc5821fffaaf0696c7b2754f1 # exported from ci-workflows security-scans-v0.2.1
+      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@f387e8af0776130d06e4544afb352d7622aee810 # exported from ci-workflows security-scans-v0.2.2
         with:
           check: funds-safety
           base: ${{ steps.base.outputs.sha }}
@@ -273,7 +273,7 @@ jobs:
             *) echo "sha=" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@713d6b97eb96534bc5821fffaaf0696c7b2754f1 # exported from ci-workflows security-scans-v0.2.1
+      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@f387e8af0776130d06e4544afb352d7622aee810 # exported from ci-workflows security-scans-v0.2.2
         with:
           check: dependencies
           base: ${{ steps.base.outputs.sha }}
