@@ -217,7 +217,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      # On a PR the checkout is the merge commit, so its first parent is the base branch as merged
+      # On a PR (or a review of one) the checkout is the merge commit, so its first parent is the base branch as merged
       # (pull_request.base.sha can be stale and would blame others' changes on this PR).
       - name: Pick the base to compare with
         id: base
@@ -226,12 +226,14 @@ jobs:
           MQ_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           case "$EVENT" in
-            pull_request) echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT" ;;
+            # A review event checks out the same merge commit, so a caller that re-runs the
+            # scans on pull_request_review (to pick up an approval) is judged the same way.
+            pull_request|pull_request_review) echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT" ;;
             merge_group) echo "sha=$MQ_BASE" >> "$GITHUB_OUTPUT" ;;
             *) echo "sha=" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@1562989174dedba79d801c95bfbfa8d6c64452a1 # exported from ci-workflows security-scans-v0.2.0
+      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@713d6b97eb96534bc5821fffaaf0696c7b2754f1 # exported from ci-workflows security-scans-v0.2.1
         with:
           check: funds-safety
           base: ${{ steps.base.outputs.sha }}
@@ -264,12 +266,14 @@ jobs:
           MQ_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           case "$EVENT" in
-            pull_request) echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT" ;;
+            # A review event checks out the same merge commit, so a caller that re-runs the
+            # scans on pull_request_review (to pick up an approval) is judged the same way.
+            pull_request|pull_request_review) echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT" ;;
             merge_group) echo "sha=$MQ_BASE" >> "$GITHUB_OUTPUT" ;;
             *) echo "sha=" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@1562989174dedba79d801c95bfbfa8d6c64452a1 # exported from ci-workflows security-scans-v0.2.0
+      - uses: tao-com-official/ci-workflows-public/.github/actions/funds-safety@713d6b97eb96534bc5821fffaaf0696c7b2754f1 # exported from ci-workflows security-scans-v0.2.1
         with:
           check: dependencies
           base: ${{ steps.base.outputs.sha }}
