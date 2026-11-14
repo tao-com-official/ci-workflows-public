@@ -195,8 +195,9 @@ runs:
           --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
         prompt: ${{ steps.prompt.outputs.prompt }}
 
-    # A throttled token fails within a second with no model usage; one retry a minute later
-    # usually runs. A failure after the model ran isn't retried (scripts/instant-failure.mjs).
+    # A throttled token, or a Claude outage, fails within a second with no model usage. Such a failure
+    # is retried up to three times, after about 1, 3 and 8 minutes (about 13 minutes in all, inside the
+    # job's 40-minute limit). A failure after the model ran isn't retried (scripts/instant-failure.mjs).
     - name: Retry an instant failure?
       id: instant
       if: steps.claude.outcome == 'failure'
@@ -242,6 +243,94 @@ runs:
           --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
         prompt: ${{ steps.prompt.outputs.prompt }}
 
+    - name: Retry an instant failure again (2)?
+      id: instant2
+      if: steps.claude_retry.outcome == 'failure'
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        EXECUTION_FILE: ${{ steps.claude_retry.outputs.execution_file }}
+        OUTCOME: ${{ steps.claude_retry.outcome }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -euo pipefail
+        node "$ACTION_DIR/scripts/instant-failure.mjs" "$OUTCOME" "${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+        if grep -qx 'retry=true' "$GITHUB_OUTPUT"; then
+          rm -f "$PREFIX-body.md" "$PREFIX-comments.json" "$PREFIX-fixed.json" "$PREFIX-meta.json"
+          # About 3 minutes, so a short outage can end first.
+          sleep $((180 + RANDOM % 31))
+        fi
+
+    - name: Run Claude a third time
+      id: claude_retry2
+      if: steps.instant2.outputs.retry == 'true'
+      continue-on-error: true
+      uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        show_full_output: false
+        # Writing is limited to the four output files, so a prompt-injected run can't write to
+        # $GITHUB_ENV, $GITHUB_PATH or a script a later step runs. Edit(...) rules cover the Write
+        # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
+        # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
+        # output_prefix is checked to be [a-z-]+ in the prompt step.
+        # --tools loads only these built-in tools (Write creates the four files; the Edit rules above
+        # still confine it). --setting-sources user turns project memory off: no CLAUDE.md, no
+        # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
+        # (the action restores those from the base branch). The base-branch rules reach the reviewer
+        # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        claude_args: >-
+          --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
+          --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+        prompt: ${{ steps.prompt.outputs.prompt }}
+
+    - name: Retry an instant failure again (3)?
+      id: instant3
+      if: steps.claude_retry2.outcome == 'failure'
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        EXECUTION_FILE: ${{ steps.claude_retry2.outputs.execution_file }}
+        OUTCOME: ${{ steps.claude_retry2.outcome }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -euo pipefail
+        node "$ACTION_DIR/scripts/instant-failure.mjs" "$OUTCOME" "${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+        if grep -qx 'retry=true' "$GITHUB_OUTPUT"; then
+          rm -f "$PREFIX-body.md" "$PREFIX-comments.json" "$PREFIX-fixed.json" "$PREFIX-meta.json"
+          # About 8 minutes: the last attempt.
+          sleep $((480 + RANDOM % 61))
+        fi
+
+    - name: Run Claude a fourth time
+      id: claude_retry3
+      if: steps.instant3.outputs.retry == 'true'
+      continue-on-error: true
+      uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        show_full_output: false
+        # Writing is limited to the four output files, so a prompt-injected run can't write to
+        # $GITHUB_ENV, $GITHUB_PATH or a script a later step runs. Edit(...) rules cover the Write
+        # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
+        # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
+        # output_prefix is checked to be [a-z-]+ in the prompt step.
+        # --tools loads only these built-in tools (Write creates the four files; the Edit rules above
+        # still confine it). --setting-sources user turns project memory off: no CLAUDE.md, no
+        # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
+        # (the action restores those from the base branch). The base-branch rules reach the reviewer
+        # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        claude_args: >-
+          --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
+          --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+        prompt: ${{ steps.prompt.outputs.prompt }}
+
     - name: Check Claude ran and wrote a review
       shell: bash
       env:
@@ -252,22 +341,40 @@ runs:
         CONCLUSION_2: ${{ steps.claude_retry.outputs.conclusion }}
         EXECUTION_FILE_2: ${{ steps.claude_retry.outputs.execution_file }}
         OUTCOME_2: ${{ steps.claude_retry.outcome }}
+        CONCLUSION_3: ${{ steps.claude_retry2.outputs.conclusion }}
+        EXECUTION_FILE_3: ${{ steps.claude_retry2.outputs.execution_file }}
+        OUTCOME_3: ${{ steps.claude_retry2.outcome }}
+        CONCLUSION_4: ${{ steps.claude_retry3.outputs.conclusion }}
+        EXECUTION_FILE_4: ${{ steps.claude_retry3.outputs.execution_file }}
+        OUTCOME_4: ${{ steps.claude_retry3.outcome }}
         RETRIED: ${{ steps.instant.outputs.retry == 'true' }}
+        RETRIED_2: ${{ steps.instant2.outputs.retry == 'true' }}
+        RETRIED_3: ${{ steps.instant3.outputs.retry == 'true' }}
+        ACTION_DIR: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        # The retry's outputs replace the first run's, which failed.
-        if [ "$RETRIED" = true ]; then n=2; else n=1; fi
+        # The last attempt that ran decides; each retry's outputs replace the failed attempt's.
+        n=1
+        if [ "$RETRIED" = true ]; then n=2; fi
+        if [ "$RETRIED_2" = true ]; then n=3; fi
+        if [ "$RETRIED_3" = true ]; then n=4; fi
         CONCLUSION=$(printenv "CONCLUSION_$n" || true)
         EXECUTION_FILE=$(printenv "EXECUTION_FILE_$n" || true)
         OUTCOME=$(printenv "OUTCOME_$n" || true)
-        if [ "$RETRIED" = true ]; then echo "Using the retry (the first run failed instantly)."; fi
+        if [ "$n" -gt 1 ]; then echo "Using attempt $n (the earlier attempts failed instantly)."; fi
+        # Four instant failures over about 13 minutes: Claude was unavailable, not the PR.
+        if [ "$n" = 4 ] && [ "$OUTCOME" = failure ] && ACTION_FILE="${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}" \
+          node --input-type=module -e "import { instantFailure } from '$ACTION_DIR/scripts/instant-failure.mjs'; import { readFileSync } from 'node:fs'; let t = null; try { t = readFileSync(process.env.ACTION_FILE, 'utf8'); } catch {} process.exit(instantFailure('failure', t) ? 0 : 1);"; then
+          echo "::error title=AI review unavailable::Claude failed instantly on 4 attempts over about 13 minutes (a throttled or unavailable token, or a Claude outage). Nothing in this PR caused it. Re-run this job once Claude is back."
+          exit 1
+        fi
         # claude-code-action sets skipped_due_to_workflow_validation_mismatch on an internal step
         # but doesn't declare it as an output (action.yml at 1d6de8cb), so it can't be read here.
         # A skip returns before Claude runs and leaves conclusion and execution_file empty.
         if [ -z "$CONCLUSION" ] || [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
           echo "::error::claude-code-action exited without running Claude (step outcome: $OUTCOME). Usual" \
-               "causes: a workflow validation skip, or an invalid or rate-limited token (an instant failure was" \
-               "already retried once). Re-run this job."
+               "causes: a workflow validation skip, or an invalid or rate-limited token (instant failures are" \
+               "retried up to three times). Re-run this job."
           exit 1
         fi
         # Full output is hidden, so name any denied tools (names only, no inputs).

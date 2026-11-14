@@ -8,7 +8,7 @@
 //      GITHUB_REPOSITORY, GITHUB_EVENT_PATH, GITHUB_STEP_SUMMARY
 import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { CONFIG_PATH, TEST_GLOBS, findApproval, git, hostAllowed, ignored, loadConfig, matchAny, prNumber, report, show } from './common.mjs';
+import { CONFIG_PATH, TEST_GLOBS, findApproval, git, hostAllowed, ignored, loadConfig, matchAny, prNumber, report, show, versionOnlyChange } from './common.mjs';
 import { LOCKFILE_RE } from './lockfiles.mjs';
 import { mergePolicies, policyFindings } from './lavamoat.mjs';
 
@@ -71,9 +71,23 @@ export function addressFindings(added, cfg) {
   return out;
 }
 
-export function sensitiveFindings(changed, cfg) {
+/**
+ * Changed sensitive files block. One exception: a file in the repo's `sensitive_paths` (never a
+ * built-in one) that matches a `version_only` entry and changed only in that entry's keys is
+ * reported instead (see common.mjs versionOnlyChange). `read(side, file)` gives the file's text at
+ * 'base' or 'head', or null when it doesn't exist there.
+ */
+export function sensitiveFindings(changed, cfg, read = () => null) {
   const globs = [...DEFAULT_SENSITIVE, ...cfg.sensitive_paths];
-  return changed.filter((f) => matchAny(f, globs)).map((file) => ({ rule: 'sensitive-file', severity: 'block', file, message: 'changes what gets installed, scanned or trusted; needs an approver' }));
+  const block = 'changes what gets installed, scanned or trusted; needs an approver';
+  return changed.filter((f) => matchAny(f, globs)).map((file) => {
+    const entries = matchAny(file, DEFAULT_SENSITIVE) ? [] : (cfg.version_only ?? []).filter((e) => matchAny(file, [e.path]));
+    if (!entries.length) return { rule: 'sensitive-file', severity: 'block', file, message: block };
+    const keys = [...new Set(entries.flatMap((e) => e.keys))];
+    const v = versionOnlyChange(read('base', file), read('head', file), keys);
+    if (v.ok) return { rule: 'sensitive-file', severity: 'report', file, message: `version-only change (${v.changed.map((k) => `\`${k}\``).join(', ') || 'formatting only'}): nothing else in the file differs` };
+    return { rule: 'sensitive-file', severity: 'block', file, message: `${block} (not a version-only change: ${v.why})` };
+  });
 }
 
 export function packageJsonFindings(file, baseText, headText) {
@@ -168,7 +182,7 @@ async function main() {
     const existing = git('diff', '--name-only', '--diff-filter=ACMRT', base, 'HEAD').split('\n').filter(Boolean);
     const added = addedLines(base);
     const changedCode = existing.filter((f) => CODE_EXT.test(f) && !matchAny(f, TEST_GLOBS));
-    findings.push(...addressFindings(added, cfg), ...sensitiveFindings(changed, cfg), ...codeShapeFindings(added));
+    findings.push(...addressFindings(added, cfg), ...sensitiveFindings(changed, cfg, (side, f) => show(side === 'base' ? base : 'HEAD', f)), ...codeShapeFindings(added));
     for (const f of changed.filter((p) => /(^|\/)package\.json$/.test(p))) findings.push(...packageJsonFindings(f, show(base, f), show('HEAD', f)));
     if (cfg.lavamoat_policies.length) {
       const read = (rev) => mergePolicies(...cfg.lavamoat_policies.map((p) => JSON.parse(show(rev, p) ?? '{}')));
