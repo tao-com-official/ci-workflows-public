@@ -19,6 +19,7 @@ From the base branch, so a PR cannot change the rules it is reviewed against:
 - review-context/checklists/jwt-security.md: only when the diff touches auth, sessions or tokens.
 - review-context/checklists/timing-safe-compare.md: only when the diff compares secrets, tokens,
   keys or nonces.
+  Checklists left out because they don't apply to this diff: {{checklists_left_out}}.
 From the PR:
 - pr-diff.txt: the diff. {{truncation_note}}
 - review-context/since-last-review.diff: what changed since your last security review. Empty on
@@ -141,3 +142,5 @@ Line rules for security-comments.json (GitHub rejects the whole review with a 42
   (context) line; that count is the right-side line number. Skip `-` lines entirely.
 - `path` MUST match the `+++ b/<path>` header exactly (no leading `b/`).
 - If you cannot map a finding to a valid right-side hunk line, put it in security-body.md instead.
+
+{{packed}}

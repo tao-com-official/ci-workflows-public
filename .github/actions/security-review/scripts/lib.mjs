@@ -65,3 +65,28 @@ export function filterDiff(diff, skipGlobs) {
 }
 
 export const changedFiles = (diff) => [...diff.matchAll(/^diff --git a\/.+? b\/(.+)$/gm)].map((m) => m[1]);
+
+// Left out of every review's diff, whatever skip_paths says: lockfiles (the dependencies and OSV
+// scans and the funds-safety lockfile guard check them by rule) and the static checks' baselines of
+// known problems (static / lint, deadcode and arch let them only shrink; coverage-guard its own).
+// The path tier is worked out before they are dropped, so dropping them never lowers it.
+export const DEFAULT_DROP = [
+  '**/package-lock.json',
+  '**/npm-shrinkwrap.json',
+  '**/yarn.lock',
+  '**/pnpm-lock.yaml',
+  '**/bun.lock',
+  '**/bun.lockb',
+  '**/Cargo.lock',
+  '**/poetry.lock',
+  '**/uv.lock',
+  '**/Pipfile.lock',
+  '**/Podfile.lock',
+  '**/Gemfile.lock',
+  '**/composer.lock',
+  '**/go.sum',
+  '**/eslint-suppressions.json',
+  '**/knip-baseline.json',
+  '**/.dependency-cruiser-known-violations.json',
+  '**/coverage-baseline.json',
+];

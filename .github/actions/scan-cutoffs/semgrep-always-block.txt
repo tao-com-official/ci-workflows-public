@@ -1,0 +1,8 @@
+# Semgrep rules that block whatever their severity (decision of 19 Nov 2026: ERROR findings block, plus
+# these WARNING rules, which guard against real attacks). A caller's semgrep_exclude_rules still turns a
+# rule off entirely: the default list excludes the mutable-action-tag rule, as before.
+# Hidden bidirectional characters (Trojan Source).
+generic.unicode.security.bidi.contains-bidirectional-characters
+solidity.security.no-bidi-characters.no-bidi-characters
+# An action referenced by a tag or branch, which its owner can move.
+yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag

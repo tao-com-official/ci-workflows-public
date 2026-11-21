@@ -1,0 +1,81 @@
+name: scan-cutoffs
+description: >-
+  security-scans' severity cut-offs (decision of 19 Nov 2026). scan: semgrep runs Semgrep with the pinned
+  rule snapshot and blocks on ERROR findings and the always-block rules; scan: osv judges the advisories a
+  change introduces (Critical always, High with a fix). Called by .github/workflows/security-scans.yml
+  pinned to a commit; not meant for direct use.
+
+inputs:
+  scan:
+    description: semgrep or osv
+    required: true
+  exclude_rules:
+    description: (semgrep) Semgrep rule ids to exclude, one per line.
+    required: false
+    default: ''
+  results:
+    description: (osv) osv-reporter's JSON output for the change.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Runs in the job's Semgrep container (Alpine: sh, git and python3 with ruamel.yaml; no node).
+    - name: Scan with the pinned Semgrep rules
+      if: inputs.scan == 'semgrep'
+      shell: sh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        EXCLUDES: ${{ inputs.exclude_rules }}
+        # The rule repos, by commit. Rules change only when a PR bumps these and semgrep-rules.txt
+        # together (scripts/bump-semgrep-rules.sh), monthly.
+        SEMGREP_RULES_SHA: a5ad1714f00c9f7fde980cab0ea1d6dc6d414fd2 # semgrep/semgrep-rules, 2026-11-19
+        TRAILOFBITS_RULES_SHA: 31390b3a99c04c81522d1b37c8d1900aa2dd4094 # trailofbits/semgrep-rules, 2026-11-19
+        # In the directory Semgrep runs in, so the rule ids keep their registry names.
+        CONFIG: .security-scans-semgrep-rules.json
+      run: |
+        set -eu
+        if [ -e "$CONFIG" ]; then
+          echo "::error::$CONFIG is security-scans' own rule file; the repo can't have one."; exit 1
+        fi
+        # Outside the workspace, so nothing a PR adds there can be mistaken for (or removed with) the rules.
+        fetch() {
+          git init -q "$2"
+          git -C "$2" fetch -q --depth 1 "https://github.com/$1.git" "$3"
+          git -C "$2" -c advice.detachedHead=false checkout -q FETCH_HEAD
+          [ "$(git -C "$2" rev-parse HEAD)" = "$3" ] || { echo "::error::$1 isn't at $3."; exit 1; }
+        }
+        rules="$RUNNER_TEMP/semgrep-rules"
+        fetch semgrep/semgrep-rules "$rules/semgrep" "$SEMGREP_RULES_SHA"
+        fetch trailofbits/semgrep-rules "$rules/trailofbits" "$TRAILOFBITS_RULES_SHA"
+        python3 "$ACTION_PATH/build-semgrep-rules.py" "$ACTION_PATH/semgrep-rules.txt" \
+          "$rules/semgrep" "$rules/trailofbits" "$CONFIG"
+        rm -rf "$rules"
+
+        # Findings alone never fail the scan (no error flag): Semgrep exits non-zero only when the scan
+        # itself fails, and the verdict is the step below.
+        set -- semgrep scan --config "$CONFIG" --exclude "$CONFIG" --metrics off --quiet \
+          --json-output "$RUNNER_TEMP/semgrep.json"
+        for r in $EXCLUDES; do set -- "$@" --exclude-rule "$r"; done
+        # The target explicitly: without one, a relative --config is looked up from the git root.
+        "$@" .
+        rm -f "$CONFIG"
+        python3 "$ACTION_PATH/semgrep-cutoff.py" "$RUNNER_TEMP/semgrep.json" "$ACTION_PATH/semgrep-always-block.txt"
+
+    - name: Judge the new advisories
+      if: inputs.scan == 'osv'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        RESULTS: ${{ inputs.results }}
+      run: node "$ACTION_PATH/osv-cutoff.mjs" "$RESULTS"
+
+    - name: Unknown scan
+      if: inputs.scan != 'semgrep' && inputs.scan != 'osv'
+      shell: sh
+      env:
+        SCAN: ${{ inputs.scan }}
+      run: |
+        echo "::error::scan-cutoffs: scan must be semgrep or osv, not '$SCAN'."
+        exit 1
