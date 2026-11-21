@@ -55,6 +55,8 @@ runs:
         BASE: ${{ inputs.base }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         SEMGREP_JSON: ${{ runner.temp }}/semgrep.json
+        # The verdict the risk gate reads (security-scans uploads it as an artifact).
+        VERDICT_OUT: ${{ runner.temp }}/funds-safety-verdict.json
       run: |
         # Judge the change against the base: drop the local ignore-file commit first.
         git reset -q --hard HEAD~1
@@ -68,6 +70,7 @@ runs:
         BASE: ${{ inputs.base }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         FINDINGS_OUT: ${{ runner.temp }}/new-packages.json
+        VERDICT_OUT: ${{ runner.temp }}/funds-safety-verdict.json
       run: node "$ACTION_PATH/scripts/dependencies.mjs"
 
     # Report-only (Fable red-team #9): GuardDog's heuristics are noisy on minified dist code.
