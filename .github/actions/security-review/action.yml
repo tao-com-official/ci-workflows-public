@@ -52,9 +52,28 @@ inputs:
       otherwise.
     default: ''
   max_turns:
+    description: The turn cap on each attempt.
     default: '100'
+  tier_modes:
+    description: >-
+      'true' on a code review's pull_request run: the classifier's verdict for the head SHA picks the
+      mode (scripts/review-mode.mjs). Low risk gets no AI review (the meta says skipped: low);
+      Medium and High get the code review as before (the separate security review follows).
+      Anything else: always the plain review.
+    default: 'false'
+  classifier_wait_seconds:
+    description: How long to look for the classifier's verdict before running the plain review.
+    default: '120'
   claude_code_oauth_token:
+    description: The primary Claude OAuth token (CLAUDE_CODE_OAUTH_TOKEN). Every review tries it first.
     required: true
+  claude_code_oauth_token_2:
+    description: >-
+      Optional. A second Claude OAuth token (CLAUDE_CODE_OAUTH_TOKEN_2), on another account. When
+      the primary fails instantly (its usage or spend limit, a rate limit, or a brief outage), every
+      retry uses this one, and the first retry doesn't wait. Empty: the retries use the primary
+      token again, with the waits.
+    default: ''
   allowed_bots:
     description: >-
       Bot accounts whose PRs are reviewed, comma-separated. claude-code-action refuses every
@@ -68,6 +87,9 @@ inputs:
     required: true
 
 outputs:
+  mode:
+    description: skip or full (see tier_modes).
+    value: ${{ steps.mode.outputs.mode }}
   tier:
     value: ${{ steps.diff.outputs.tier }}
   effort:
@@ -92,6 +114,7 @@ runs:
         MODEL: ${{ inputs.model }}
         MODEL_LOW: ${{ inputs.model_low }}
         EFFORT: ${{ inputs.effort }}
+        MAX_TURNS: ${{ inputs.max_turns }}
       run: |
         set -euo pipefail
         node "$ACTION_DIR/scripts/prepare-diff.mjs" full.diff "$RISK_FILE" "$SKIP_PATHS" since.diff "$ROUND" "${SINCE_FROM:-$ROUND_CAP}" > diff-info.json
@@ -104,6 +127,7 @@ runs:
         model=$MODEL
         if [ "$tier" = Low ] && [ -n "$MODEL_LOW" ]; then model=$MODEL_LOW; fi
         [[ "$model" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || { echo "::error::model '$model' isn't a model name."; exit 1; }
+        [[ "$MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::max_turns must be a whole number."; exit 1; }
         case "$effort" in low|medium|high|xhigh|max) ;; *) echo "::error::effort '$effort' isn't low, medium, high, xhigh or max."; exit 1 ;; esac
         echo "Tier $tier: $model at effort $effort."
         {
@@ -111,10 +135,65 @@ runs:
           echo "effort=$effort"
           echo "model=$model"
         } >> "$GITHUB_OUTPUT"
-        cp since.diff review-context/since-last-review.diff
+        mv since-filtered.diff review-context/since-last-review.diff
+
+    # The verdict is a workflow artifact of the risk gate's classify job, trusted only from a run of
+    # this repo (not a fork) for this SHA, or from the default branch, as the security review reads it.
+    # It can lag this job, so it's looked for for up to classifier_wait_seconds; missing, the plain
+    # review runs. The gate's classifier never runs on its own High paths, so they always get it.
+    - name: Choose the review mode
+      id: mode
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        TIER_MODES: ${{ inputs.tier_modes }}
+        TIER: ${{ steps.diff.outputs.tier }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        SHA: ${{ inputs.commit_id }}
+        WAIT_SECONDS: ${{ inputs.classifier_wait_seconds }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -uo pipefail
+        rm -rf "$RUNNER_TEMP/ai-review-verdict"
+        if [ "$TIER_MODES" = true ] && [ "$TIER" != High ] && [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+          default_branch=$(gh api "repos/$REPO" -q .default_branch) || default_branch=main
+          url=""
+          for _ in $(seq 0 15 "$WAIT_SECONDS"); do
+            url=$(gh api "repos/$REPO/actions/artifacts?name=risk-classifier-$SHA&per_page=100" \
+              -q "[.artifacts[] | select((.expired | not) and .workflow_run.head_repository_id == .workflow_run.repository_id and (.workflow_run.head_sha == \"$SHA\" or .workflow_run.head_branch == \"$default_branch\"))][0].archive_download_url // \"\"") || url=""
+            [ -n "$url" ] && break
+            sleep 15
+          done
+          if [ -z "$url" ]; then
+            echo "No classifier verdict for ${SHA:0:7} after ${WAIT_SECONDS}s; the plain review runs."
+          elif gh api "$url" > "$RUNNER_TEMP/ai-review-verdict.zip" && unzip -o -q "$RUNNER_TEMP/ai-review-verdict.zip" -d "$RUNNER_TEMP/ai-review-verdict"; then
+            jq -c '{floor, tier, needs_person}' "$RUNNER_TEMP/ai-review-verdict/risk.json" | sed 's/^/Classifier verdict: /'
+          else
+            echo "Couldn't read the classifier verdict for ${SHA:0:7}; the plain review runs."
+          fi
+          rm -f "$RUNNER_TEMP/ai-review-verdict.zip"
+        fi
+        mode=full
+        if [ "$TIER_MODES" = true ]; then
+          mode=$(node "$ACTION_DIR/scripts/review-mode.mjs" "$TIER" "$RUNNER_TEMP/ai-review-verdict/risk.json") || mode=full
+        fi
+        case "$mode" in
+          skip)
+            # Passes with a meta that says so; the risk gate honours `skipped: low` only when its own
+            # tier for this SHA is Low.
+            jq -n '{skipped: "low", mode: "skip", important: 0, nits: 0, cap: false, coverage: "none", tier: "Low", open: []}' > "$PREFIX-meta.json"
+            msg="No AI review: ${SHA:0:7} is Low risk (all paths Low, classifier agreed)."
+            echo "::notice title=No AI review (Low risk)::$msg"
+            printf '### Code review\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY" ;;
+          *) mode=full ;;
+        esac
+        echo "Review mode: $mode."
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
     - name: Render the prompt
       id: prompt
+      if: steps.mode.outputs.mode != 'skip'
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
@@ -134,6 +213,9 @@ runs:
         if [ -d "$ACTION_DIR/checklists/$REVIEWER" ]; then
           cp "$ACTION_DIR/checklists/$REVIEWER"/*.md review-context/checklists/
         fi
+        # Conditional checklists that don't apply to this diff are left out (scripts/select-checklists.mjs).
+        left_out=$(node "$ACTION_DIR/scripts/select-checklists.mjs" review-context/checklists pr-diff.txt "$SERVER_PATHS")
+        [ -z "$left_out" ] || echo "Checklists left out (they don't apply to this diff): $left_out."
         note=""
         if [ "$(jq -r .scoped_to_since diff-info.json)" = true ]; then
           note="This round, this file holds only the changes since your last review. Flag the class of each bug and list every instance."
@@ -144,19 +226,36 @@ runs:
         if [ "$(jq '.skipped | length' diff-info.json)" != 0 ]; then
           note="$note Files matching this repo's skip_paths were left out: $(jq -r '.skipped | join(", ")' diff-info.json)."
         fi
+        if [ "$(jq '.dropped | length' diff-info.json)" != 0 ]; then
+          note="$note Lockfiles and baseline files were left out (the dependency scans and static checks gate them): $(jq -r '.dropped | join(", ")' diff-info.json)."
+        fi
         jq -n --arg pr "$PR" --arg repo "$REPO" --arg round "$ROUND" --arg tier "$(jq -r .tier diff-info.json)" \
           --rawfile pr_description pr-description.md --arg truncation_note "${note# }" \
           --arg server_paths "$(printf '%s' "$SERVER_PATHS" | awk 'NF { printf "%s%s", sep, $0; sep=", " }')" \
+          --arg checklists_left_out "${left_out:-none}" \
           '{pr: $pr, repo: $repo, round: $round, tier: $tier, pr_description: $pr_description, truncation_note: $truncation_note,
-            server_paths: (if $server_paths == "" then "none configured" else $server_paths end)}' \
+            server_paths: (if $server_paths == "" then "none configured" else $server_paths end),
+            checklists_left_out: $checklists_left_out, packed: ""}' \
           > "$RUNNER_TEMP/ai-review-vars.json"
+        # The diff and the changed files go into the prompt while it stays under PROMPT_LIMIT bytes
+        # (one environment value holds at most 128 KiB), so the reviewer doesn't spend a turn on each.
+        PROMPT_LIMIT=100000
         node "$ACTION_DIR/scripts/render-prompt.mjs" "$ACTION_DIR/prompts/$REVIEWER.md" "$RUNNER_TEMP/ai-review-vars.json" > "$RUNNER_TEMP/ai-review-prompt.md"
+        budget=$(( PROMPT_LIMIT - $(wc -c < "$RUNNER_TEMP/ai-review-prompt.md") - 600 ))
+        node "$ACTION_DIR/scripts/pack-context.mjs" pr-diff.txt "$(( budget > 0 ? budget : 0 ))" > "$RUNNER_TEMP/ai-review-packed.json"
+        jq -c '{diff, files: (.files | length), bytes_left: .left}' "$RUNNER_TEMP/ai-review-packed.json" | sed 's/^/Packed: /'
+        if [ "$(jq -r .diff "$RUNNER_TEMP/ai-review-packed.json")" = true ]; then
+          jq --slurpfile p "$RUNNER_TEMP/ai-review-packed.json" '.packed = $p[0].section' "$RUNNER_TEMP/ai-review-vars.json" > "$RUNNER_TEMP/ai-review-vars.packed.json"
+          node "$ACTION_DIR/scripts/render-prompt.mjs" "$ACTION_DIR/prompts/$REVIEWER.md" "$RUNNER_TEMP/ai-review-vars.packed.json" > "$RUNNER_TEMP/ai-review-prompt.md"
+        fi
+        echo "Prompt: $(wc -c < "$RUNNER_TEMP/ai-review-prompt.md") bytes."
         d="ghout_$(openssl rand -hex 16)"
         { echo "prompt<<$d"; cat "$RUNNER_TEMP/ai-review-prompt.md"; echo "$d"; } >> "$GITHUB_OUTPUT"
 
     # Red with the fix, rather than claude-code-action's "exited without running Claude". A
     # Dependabot run reads Dependabot secrets only, so an Actions-only token is empty there.
     - name: Check the OAuth token
+      if: steps.mode.outputs.mode != 'skip'
       shell: bash
       env:
         HAS_TOKEN: ${{ inputs.claude_code_oauth_token != '' }}
@@ -172,10 +271,12 @@ runs:
 
     - name: Run Claude
       id: claude
+      if: steps.mode.outputs.mode != 'skip'
       continue-on-error: true
       uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        anthropic_api_key: ''
         github_token: ${{ inputs.github_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         show_full_output: false
@@ -189,14 +290,24 @@ runs:
         # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
         # (the action restores those from the base branch). The base-branch rules reach the reviewer
         # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        # Reads are confined to the workspace (the checkout and the files the workflow wrote there):
+        # `Read(/**)` is the only read rule, and Claude Code applies it to Glob and Grep too, and refuses
+        # a symlink in the checkout that points outside it. A bare Read, Glob or Grep would let a
+        # prompt-injected run read the runner's own files (Phase 2.2; tests/ai-review.test.mjs).
         claude_args: >-
           --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
           --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
-          --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+          --allowedTools "Read(/**),Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
         prompt: ${{ steps.prompt.outputs.prompt }}
 
-    # A throttled token fails within a second with no model usage; one retry a minute later
-    # usually runs. A failure after the model ran isn't retried (scripts/instant-failure.mjs).
+    # A throttled token, or a Claude outage, fails within a second with no model usage. Such a failure
+    # is retried up to three times, after about 1, 3 and 8 minutes (about 13 minutes in all, inside the
+    # job's 40-minute limit). A failure after the model ran isn't retried (scripts/instant-failure.mjs).
+    # Credentials: the primary OAuth token first; every retry uses claude_code_oauth_token_2 when it
+    # was passed, so a primary that ran out or hit a limit hands over to the second account. The
+    # first retry onto the second token doesn't wait (it isn't throttled with the primary); the later
+    # ones keep their waits, for an outage. Without a second token every attempt uses the primary
+    # token, with the waits, as before. No API key is ever passed.
     - name: Retry an instant failure?
       id: instant
       if: steps.claude.outcome == 'failure'
@@ -206,14 +317,19 @@ runs:
         EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
         OUTCOME: ${{ steps.claude.outcome }}
         PREFIX: ${{ inputs.output_prefix }}
+        NEXT_IS_SECOND_TOKEN: ${{ inputs.claude_code_oauth_token_2 != '' }}
       run: |
         set -euo pipefail
         node "$ACTION_DIR/scripts/instant-failure.mjs" "$OUTCOME" "${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
         if grep -qx 'retry=true' "$GITHUB_OUTPUT"; then
           # Nothing the first run wrote may be read as the retry's.
           rm -f "$PREFIX-body.md" "$PREFIX-comments.json" "$PREFIX-fixed.json" "$PREFIX-meta.json"
-          # 60-90 s, so PRs throttled together don't all retry together.
-          sleep $((60 + RANDOM % 31))
+          if [ "$NEXT_IS_SECOND_TOKEN" = true ]; then
+            echo "The primary OAuth token failed instantly; retrying now with the secondary token."
+          else
+            # 60-90 s, so PRs throttled together don't all retry together.
+            sleep $((60 + RANDOM % 31))
+          fi
         fi
 
     - name: Run Claude again
@@ -222,7 +338,8 @@ runs:
       continue-on-error: true
       uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
       with:
-        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token_2 || inputs.claude_code_oauth_token }}
+        anthropic_api_key: ''
         github_token: ${{ inputs.github_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         show_full_output: false
@@ -236,13 +353,116 @@ runs:
         # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
         # (the action restores those from the base branch). The base-branch rules reach the reviewer
         # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        # Reads are confined to the workspace (the checkout and the files the workflow wrote there):
+        # `Read(/**)` is the only read rule, and Claude Code applies it to Glob and Grep too, and refuses
+        # a symlink in the checkout that points outside it. A bare Read, Glob or Grep would let a
+        # prompt-injected run read the runner's own files (Phase 2.2; tests/ai-review.test.mjs).
         claude_args: >-
           --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
           --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
-          --allowedTools "Read,Glob,Grep,Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+          --allowedTools "Read(/**),Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+        prompt: ${{ steps.prompt.outputs.prompt }}
+
+    - name: Retry an instant failure again (2)?
+      id: instant2
+      if: steps.claude_retry.outcome == 'failure'
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        EXECUTION_FILE: ${{ steps.claude_retry.outputs.execution_file }}
+        OUTCOME: ${{ steps.claude_retry.outcome }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -euo pipefail
+        node "$ACTION_DIR/scripts/instant-failure.mjs" "$OUTCOME" "${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+        if grep -qx 'retry=true' "$GITHUB_OUTPUT"; then
+          rm -f "$PREFIX-body.md" "$PREFIX-comments.json" "$PREFIX-fixed.json" "$PREFIX-meta.json"
+          # About 3 minutes, so a short outage can end first.
+          sleep $((180 + RANDOM % 31))
+        fi
+
+    - name: Run Claude a third time
+      id: claude_retry2
+      if: steps.instant2.outputs.retry == 'true'
+      continue-on-error: true
+      uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token_2 || inputs.claude_code_oauth_token }}
+        anthropic_api_key: ''
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        show_full_output: false
+        # Writing is limited to the four output files, so a prompt-injected run can't write to
+        # $GITHUB_ENV, $GITHUB_PATH or a script a later step runs. Edit(...) rules cover the Write
+        # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
+        # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
+        # output_prefix is checked to be [a-z-]+ in the prompt step.
+        # --tools loads only these built-in tools (Write creates the four files; the Edit rules above
+        # still confine it). --setting-sources user turns project memory off: no CLAUDE.md, no
+        # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
+        # (the action restores those from the base branch). The base-branch rules reach the reviewer
+        # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        # Reads are confined to the workspace (the checkout and the files the workflow wrote there):
+        # `Read(/**)` is the only read rule, and Claude Code applies it to Glob and Grep too, and refuses
+        # a symlink in the checkout that points outside it. A bare Read, Glob or Grep would let a
+        # prompt-injected run read the runner's own files (Phase 2.2; tests/ai-review.test.mjs).
+        claude_args: >-
+          --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
+          --allowedTools "Read(/**),Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
+        prompt: ${{ steps.prompt.outputs.prompt }}
+
+    - name: Retry an instant failure again (3)?
+      id: instant3
+      if: steps.claude_retry2.outcome == 'failure'
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        EXECUTION_FILE: ${{ steps.claude_retry2.outputs.execution_file }}
+        OUTCOME: ${{ steps.claude_retry2.outcome }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        set -euo pipefail
+        node "$ACTION_DIR/scripts/instant-failure.mjs" "$OUTCOME" "${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+        if grep -qx 'retry=true' "$GITHUB_OUTPUT"; then
+          rm -f "$PREFIX-body.md" "$PREFIX-comments.json" "$PREFIX-fixed.json" "$PREFIX-meta.json"
+          # About 8 minutes: the last attempt.
+          sleep $((480 + RANDOM % 61))
+        fi
+
+    - name: Run Claude a fourth time
+      id: claude_retry3
+      if: steps.instant3.outputs.retry == 'true'
+      continue-on-error: true
+      uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token_2 || inputs.claude_code_oauth_token }}
+        anthropic_api_key: ''
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        show_full_output: false
+        # Writing is limited to the four output files, so a prompt-injected run can't write to
+        # $GITHUB_ENV, $GITHUB_PATH or a script a later step runs. Edit(...) rules cover the Write
+        # tool; `Write(./review-*)` matches nothing and denies every write, and `Edit(./review-*)`
+        # matches at any depth (review-context/**). `/x` is anchored to the workspace root.
+        # output_prefix is checked to be [a-z-]+ in the prompt step.
+        # --tools loads only these built-in tools (Write creates the four files; the Edit rules above
+        # still confine it). --setting-sources user turns project memory off: no CLAUDE.md, no
+        # AGENTS.md (Claude Code loads it as memory too), no .claude/ settings, skills or commands
+        # (the action restores those from the base branch). The base-branch rules reach the reviewer
+        # through review-context/ instead. --disable-slash-commands drops the built-in skills.
+        # Reads are confined to the workspace (the checkout and the files the workflow wrote there):
+        # `Read(/**)` is the only read rule, and Claude Code applies it to Glob and Grep too, and refuses
+        # a symlink in the checkout that points outside it. A bare Read, Glob or Grep would let a
+        # prompt-injected run read the runner's own files (Phase 2.2; tests/ai-review.test.mjs).
+        claude_args: >-
+          --model ${{ steps.diff.outputs.model }} --effort ${{ steps.diff.outputs.effort }} --max-turns ${{ inputs.max_turns }}
+          --tools "Read,Glob,Grep,Edit,Write" --setting-sources user --disable-slash-commands
+          --allowedTools "Read(/**),Edit(/${{ inputs.output_prefix }}-body.md),Edit(/${{ inputs.output_prefix }}-comments.json),Edit(/${{ inputs.output_prefix }}-fixed.json),Edit(/${{ inputs.output_prefix }}-meta.json)"
         prompt: ${{ steps.prompt.outputs.prompt }}
 
     - name: Check Claude ran and wrote a review
+      if: steps.mode.outputs.mode != 'skip'
       shell: bash
       env:
         BODY: ${{ inputs.output_prefix }}-body.md
@@ -252,22 +472,45 @@ runs:
         CONCLUSION_2: ${{ steps.claude_retry.outputs.conclusion }}
         EXECUTION_FILE_2: ${{ steps.claude_retry.outputs.execution_file }}
         OUTCOME_2: ${{ steps.claude_retry.outcome }}
+        CONCLUSION_3: ${{ steps.claude_retry2.outputs.conclusion }}
+        EXECUTION_FILE_3: ${{ steps.claude_retry2.outputs.execution_file }}
+        OUTCOME_3: ${{ steps.claude_retry2.outcome }}
+        CONCLUSION_4: ${{ steps.claude_retry3.outputs.conclusion }}
+        EXECUTION_FILE_4: ${{ steps.claude_retry3.outputs.execution_file }}
+        OUTCOME_4: ${{ steps.claude_retry3.outcome }}
         RETRIED: ${{ steps.instant.outputs.retry == 'true' }}
+        RETRIED_2: ${{ steps.instant2.outputs.retry == 'true' }}
+        RETRIED_3: ${{ steps.instant3.outputs.retry == 'true' }}
+        HAS_SECOND_TOKEN: ${{ inputs.claude_code_oauth_token_2 != '' }}
+        ACTION_DIR: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        # The retry's outputs replace the first run's, which failed.
-        if [ "$RETRIED" = true ]; then n=2; else n=1; fi
+        # The last attempt that ran decides; each retry's outputs replace the failed attempt's.
+        n=1
+        if [ "$RETRIED" = true ]; then n=2; fi
+        if [ "$RETRIED_2" = true ]; then n=3; fi
+        if [ "$RETRIED_3" = true ]; then n=4; fi
         CONCLUSION=$(printenv "CONCLUSION_$n" || true)
         EXECUTION_FILE=$(printenv "EXECUTION_FILE_$n" || true)
         OUTCOME=$(printenv "OUTCOME_$n" || true)
-        if [ "$RETRIED" = true ]; then echo "Using the retry (the first run failed instantly)."; fi
+        if [ "$n" -gt 1 ]; then echo "Using attempt $n (the earlier attempts failed instantly)."; fi
+        # Which OAuth token that attempt used (a name, never the value), for the spend report.
+        credential=primary
+        if [ "$n" -gt 1 ] && [ "$HAS_SECOND_TOKEN" = true ]; then credential=secondary; fi
+        echo "Credential: $credential"
+        # Four instant failures over about 13 minutes: Claude was unavailable, not the PR.
+        if [ "$n" = 4 ] && [ "$OUTCOME" = failure ] && ACTION_FILE="${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}" \
+          node --input-type=module -e "import { instantFailure } from '$ACTION_DIR/scripts/instant-failure.mjs'; import { readFileSync } from 'node:fs'; let t = null; try { t = readFileSync(process.env.ACTION_FILE, 'utf8'); } catch {} process.exit(instantFailure('failure', t) ? 0 : 1);"; then
+          echo "::error title=AI review unavailable::Claude failed instantly on 4 attempts (the primary OAuth token CLAUDE_CODE_OAUTH_TOKEN, then CLAUDE_CODE_OAUTH_TOKEN_2 if it was passed, else the primary again): both tokens are out of usage, over a limit or invalid, or Claude is down. Nothing in this PR caused it. Re-run this job once a token has usage again or Claude is back."
+          exit 1
+        fi
         # claude-code-action sets skipped_due_to_workflow_validation_mismatch on an internal step
         # but doesn't declare it as an output (action.yml at 1d6de8cb), so it can't be read here.
         # A skip returns before Claude runs and leaves conclusion and execution_file empty.
         if [ -z "$CONCLUSION" ] || [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
           echo "::error::claude-code-action exited without running Claude (step outcome: $OUTCOME). Usual" \
-               "causes: a workflow validation skip, or an invalid or rate-limited token (an instant failure was" \
-               "already retried once). Re-run this job."
+               "causes: a workflow validation skip, or an invalid or rate-limited token (instant failures are" \
+               "retried up to three times). Re-run this job."
           exit 1
         fi
         # Full output is hidden, so name any denied tools (names only, no inputs).
@@ -296,13 +539,14 @@ runs:
         fi
 
     - name: Build the review and its meta
+      if: steps.mode.outputs.mode != 'skip'
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
         CTX: >-
           {"marker": "<!-- ai-review:${{ inputs.marker }} -->", "round": ${{ inputs.round }},
           "round_cap": ${{ inputs.round_cap }}, "commit_id": "${{ inputs.commit_id }}",
-          "prefix": "${{ inputs.output_prefix }}"}
+          "prefix": "${{ inputs.output_prefix }}", "mode": "${{ steps.mode.outputs.mode }}"}
       run: |
         set -euo pipefail
         ctx=$(jq -c --slurpfile info diff-info.json '. + {truncated: $info[0].truncated, skipped: $info[0].skipped, tier: $info[0].tier}' <<<"$CTX")
