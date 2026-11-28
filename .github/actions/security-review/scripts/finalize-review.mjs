@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 const MAX_BODY = 65_000;
 
 export function finalize(ctx, files) {
-  const { marker, round, round_cap: roundCap, commit_id: commitId, truncated, skipped = [], tier } = ctx;
+  const { marker, round, round_cap: roundCap, commit_id: commitId, truncated, skipped = [], tier, mode } = ctx;
   if (!files.body?.trim()) return { error: 'the review body is missing or empty' };
   const parse = (text, fallback) => {
     try {
@@ -71,6 +71,9 @@ export function finalize(ctx, files) {
     skipped_paths: skipped,
     // The path-floor tier, so a run that reuses this meta can still report it.
     ...(tier ? { tier } : {}),
+    // The review mode (`full`; a `skip` meta is written by the action without a review), so a run
+    // that reuses this meta can still report it.
+    ...(mode ? { mode } : {}),
   };
   const hidden = `\n\n<!-- ai-review:meta ${JSON.stringify(meta).replace(/--/g, '\\u002d\\u002d')} -->`;
   let full = `${marker}\n${body.trim()}`;

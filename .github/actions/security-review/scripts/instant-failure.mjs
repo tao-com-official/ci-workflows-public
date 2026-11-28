@@ -46,6 +46,6 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     text = null;
   }
   const why = instantFailure(outcome, text);
-  console.log(why ? `Claude failed instantly (${why}); retrying once in about a minute.` : `No retry (step outcome: ${outcome}).`);
+  console.log(why ? `Claude failed instantly (${why}); retrying after a wait.` : `No retry (step outcome: ${outcome}).`);
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `retry=${why ? 'true' : 'false'}\n`);
 }
